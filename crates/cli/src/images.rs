@@ -74,6 +74,12 @@ fn run(command: &mut Command) -> Option<Vec<u8>> {
     }
 }
 
+/// Run a command and report success without leaking its stderr into the REPL.
+/// macOS ImageIO prints JP2 color-space warnings for some clipboard images.
+fn succeeded(command: &mut Command) -> bool {
+    matches!(command.output(), Ok(output) if output.status.success())
+}
+
 #[cfg(target_os = "macos")]
 fn capture_macos() -> Result<Option<Vec<u8>>> {
     // 1. `pngpaste` is the cleanest path when installed.
@@ -92,8 +98,9 @@ fn capture_macos() -> Result<Option<Vec<u8>>> {
          close access outFile",
         png.display()
     );
-    let status = Command::new("osascript").arg("-e").arg(&script).status();
-    if matches!(status, Ok(status) if status.success()) {
+    let mut command = Command::new("osascript");
+    command.arg("-e").arg(&script);
+    if succeeded(&mut command) {
         if let Ok(bytes) = std::fs::read(&png) {
             let _ = std::fs::remove_file(&png);
             if detect_mime(&bytes).is_some() {
@@ -113,16 +120,16 @@ fn capture_macos() -> Result<Option<Vec<u8>>> {
          close access outFile",
         tiff.display()
     );
-    let status = Command::new("osascript").arg("-e").arg(&script).status();
-    if matches!(status, Ok(status) if status.success()) {
+    let mut command = Command::new("osascript");
+    command.arg("-e").arg(&script);
+    if succeeded(&mut command) {
         let converted = temp_path("png");
-        let converted_status = Command::new("sips")
-            .args(["-s", "format", "png"])
+        let mut sips = Command::new("sips");
+        sips.args(["-s", "format", "png"])
             .arg(&tiff)
             .arg("--out")
-            .arg(&converted)
-            .status();
-        let bytes = if matches!(converted_status, Ok(status) if status.success()) {
+            .arg(&converted);
+        let bytes = if succeeded(&mut sips) {
             std::fs::read(&converted).ok()
         } else {
             None
@@ -185,10 +192,9 @@ fn capture_windows() -> Result<Option<Vec<u8>>> {
          $img.Save(\"{}\", [System.Drawing.Imaging.ImageFormat]::Png)",
         png.display()
     );
-    let status = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .status();
-    if matches!(status, Ok(status) if status.success()) {
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-Command", &script]);
+    if succeeded(&mut command) {
         if let Ok(bytes) = std::fs::read(&png) {
             let _ = std::fs::remove_file(&png);
             if detect_mime(&bytes).is_some() {
