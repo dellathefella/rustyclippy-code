@@ -252,16 +252,13 @@ fn paste_clipboard(
     match images::capture_clipboard() {
         Ok(Some(image)) => {
             pending.push(image);
-            print!("\r\n");
-            println!("image attached · {} pending", pending.len());
+            print!("image attached · {} pending\r\n", pending.len());
         }
         Ok(None) => {
-            print!("\r\n");
-            println!("clipboard has no image");
+            print!("clipboard has no image\r\n");
         }
         Err(error) => {
-            print!("\r\n");
-            println!("clipboard capture failed: {error}");
+            print!("clipboard capture failed: {error}\r\n");
         }
     }
     print!("{prompt}{buffer}");
