@@ -1,0 +1,13 @@
+# Build artifacts
+/target
+/.cargo-home
+
+# Local test state
+/.deeprust-test
+
+# Local configuration (may contain private endpoint addresses)
+/deeprust.json
+
+# OS noise
+.DS_Store
+*.log

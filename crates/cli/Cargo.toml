@@ -1,0 +1,29 @@
+[package]
+name = "deeprust-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "deeprust command-line coding agent"
+
+[[bin]]
+name = "deeprust"
+path = "src/main.rs"
+
+[dependencies]
+deeprust-core = { path = "../core" }
+deeprust-llm = { path = "../llm" }
+deeprust-tools = { path = "../tools" }
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+clap.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

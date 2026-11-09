@@ -1,0 +1,44 @@
+{
+  "provider": {
+    "kind": "openai_compat",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "api_key_env": "",
+    "model": "DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw",
+    "max_context_tokens": 262144,
+    "max_output_tokens": 8192,
+    "temperature": 0.2,
+    "cache_prompt": true,
+    "include_reasoning_in_history": false,
+    "reasoning_effort": "high",
+    "timeout_secs": 600
+  },
+  "agent": {
+    "mode": "build",
+    "max_steps": 60,
+    "max_depth": 3
+  },
+  "cache": {
+    "autocompact_at_tokens": 250000,
+    "compaction_threshold": 0.85,
+    "head_messages": 2,
+    "tail_messages": 8,
+    "min_compaction_gain_tokens": 2048,
+    "tool_output_max_chars": 12000,
+    "granularity": 64,
+    "assume_warm_resume": false,
+    "summary_max_tokens": 1024
+  },
+  "permissions": {
+    "bash": "ask",
+    "edit": "ask",
+    "write": "ask",
+    "task": "ask"
+  },
+  "web": {
+    "provider": "duckduckgo",
+    "api_key_env": "BRAVE_API_KEY",
+    "searxng_url": null,
+    "max_results": 8,
+    "fetch_max_chars": 20000
+  }
+}
