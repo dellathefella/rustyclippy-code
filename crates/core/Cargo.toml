@@ -1,12 +1,12 @@
 [package]
-name = "deeprust-core"
+name = "rustyclippy-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Cache-stable context engine, transcript, session store and config for deeprust"
+description = "Cache-stable context engine, transcript, session store and config for rustyclippy-code"
 
 [dependencies]
 anyhow.workspace = true

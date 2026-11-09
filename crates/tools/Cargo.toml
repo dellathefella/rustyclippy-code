@@ -1,15 +1,15 @@
 [package]
-name = "deeprust-tools"
+name = "rustyclippy-tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Tool implementations and registry for deeprust"
+description = "Tool implementations and registry for rustyclippy-code"
 
 [dependencies]
-deeprust-core = { path = "../core" }
+rustyclippy-core = { path = "../core" }
 anyhow.workspace = true
 async-trait.workspace = true
 globset.workspace = true

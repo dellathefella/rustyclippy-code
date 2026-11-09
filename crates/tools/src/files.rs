@@ -329,7 +329,7 @@ fn exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deeprust_core::AgentMode;
+    use rustyclippy_core::AgentMode;
     use tempfile::TempDir;
 
     fn context(dir: &TempDir) -> ToolContext {

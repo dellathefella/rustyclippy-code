@@ -1,4 +1,4 @@
-//! LLM providers for deeprust.
+//! LLM providers for rustyclippy-code.
 
 pub mod openai;
 pub mod provider;

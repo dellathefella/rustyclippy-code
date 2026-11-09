@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use deeprust_core::config::WebProvider;
 use regex::Regex;
+use rustyclippy_core::config::WebProvider;
 use serde_json::{json, Value};
 
 use crate::registry::{Tool, ToolContext, ToolResult};
@@ -161,7 +161,7 @@ fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(60))
-        .user_agent("Mozilla/5.0 (compatible; deeprust/0.1)")
+        .user_agent("Mozilla/5.0 (compatible; rustyclippy-code/0.1)")
         .build()
         .context("building HTTP client")
 }
@@ -450,7 +450,7 @@ mod tests {
     fn fetch_rejects_non_http_urls() {
         let ctx = ToolContext::new(
             std::path::PathBuf::from("/tmp"),
-            deeprust_core::AgentMode::Build,
+            rustyclippy_core::AgentMode::Build,
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let result =

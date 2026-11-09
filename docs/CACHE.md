@@ -1,6 +1,6 @@
 # Cache design
 
-This document explains why `deeprust` is structured the way it is. The goal is
+This document explains why `rustyclippy-code` is structured the way it is. The goal is
 simple: **never re-prefill tokens the server already has.**
 
 ## The cost model
@@ -41,9 +41,9 @@ remove a message. `Message::wire_hash()` hashes exactly the wire form, excluding
 
 ### 4. Volatile context is appended once
 
-cwd, platform, shell, and model live in a single `<environment>` user message at
-session start. It is part of the transcript, not the system prompt, so it is
-stable for the session. If a resumed session runs in a different cwd, a new
+cwd, platform, shell, and model live in a single `<environment>` system-role
+message at session start. It is part of the transcript, not the system prompt, so
+it is stable for the session. If a resumed session runs in a different cwd, a new
 environment message is appended — appending is safe; rewriting is not.
 
 ### 5. Compaction preserves the head
@@ -100,7 +100,7 @@ Each turn records:
 | `prompt_hash` | hash of the full wire prompt |
 | `stable` | no unexpected divergence |
 
-`deeprust cache report` prints the table; `--json` emits the raw records.
+`rustyclippy-code cache report` prints the table; `--json` emits the raw records.
 
 The engine also reports its own estimate (`reusable_tokens`, floored to the 64
 token granularity) so you can see the plan before the server answers.

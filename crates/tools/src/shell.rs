@@ -251,7 +251,7 @@ async fn read_all<R: AsyncRead + Unpin>(mut reader: R) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deeprust_core::AgentMode;
+    use rustyclippy_core::AgentMode;
     use std::path::PathBuf;
 
     fn context() -> ToolContext {

@@ -1,15 +1,15 @@
 [package]
-name = "deeprust-llm"
+name = "rustyclippy-llm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "OpenAI-compatible and DeepSeek streaming providers for deeprust"
+description = "OpenAI-compatible and DeepSeek streaming providers for rustyclippy-code"
 
 [dependencies]
-deeprust-core = { path = "../core" }
+rustyclippy-core = { path = "../core" }
 anyhow.workspace = true
 async-stream = "0.3"
 async-trait.workspace = true

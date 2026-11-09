@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
-repository = "https://github.com/dellathefella/deeprust"
+repository = "https://github.com/dellathefella/rustyclippy-code"
 authors = ["Jacob Della"]
 
 [workspace.dependencies]

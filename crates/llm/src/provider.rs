@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use deeprust_core::{Breakpoint, Message, ProviderConfig, ProviderKind};
 use futures_util::stream::BoxStream;
+use rustyclippy_core::{Breakpoint, Message, ProviderConfig, ProviderKind};
 use serde_json::Value;
 
 use crate::openai::OpenAiProvider;

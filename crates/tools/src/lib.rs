@@ -1,4 +1,4 @@
-//! Tool implementations for deeprust.
+//! Tool implementations for rustyclippy-code.
 
 pub mod files;
 pub mod question;
