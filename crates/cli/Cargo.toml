@@ -20,6 +20,7 @@ anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 clap.workspace = true
+libc.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true

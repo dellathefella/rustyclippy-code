@@ -93,10 +93,12 @@ switch is recorded in the session log and replayed on resume.
 
 ### Images
 
-Vision-capable servers accept images attached to a prompt. `/paste` reads the
-clipboard image through native tooling (`pngpaste`/AppleScript on macOS,
-`wl-paste`/`xclip` on Linux, PowerShell on Windows); `/image <path>` attaches a
-file; a pasted or dragged image path in the prompt is detected automatically.
+Vision-capable servers accept images attached to a prompt. In the REPL, press
+**Ctrl+V** to attach the clipboard image directly (or use `/paste`); `/image
+<path>` attaches a file; a pasted or dragged image path in the prompt is detected
+automatically. `/paste` reads the clipboard image through native tooling
+(`pngpaste`/AppleScript on macOS, `wl-paste`/`xclip` on Linux, PowerShell on
+Windows).
 Images travel as base64 `data:` URLs in the OpenAI-compatible content-parts
 shape, so they stay part of the byte-stable prefix.
 

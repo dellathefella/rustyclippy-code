@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
 use std::collections::BTreeMap;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use rustyclippy_tools::SubagentRunner;
 
 use crate::agent::{Agent, TurnResult};
 use crate::images;
+use crate::input::{self, InputOutcome};
 use crate::subagent_runner::CliSubagentRunner;
 use crate::ui::{fmt_bytes, fmt_num, Output};
 
@@ -109,7 +110,7 @@ pub async fn chat(
 
     print_header(&agent);
     agent.output.hint(
-        "commands: /exit /session /cache /stats /new /mode build|plan /paste /image <path> /clear-images /help",
+        "Ctrl+V pastes a clipboard image · /exit /session /cache /stats /new /mode build|plan /paste /image <path> /clear-images /help",
     );
 
     let context = ChatContext {
@@ -123,12 +124,11 @@ pub async fn chat(
         if !pending_images.is_empty() {
             agent.output.pending_images(pending_images.len());
         }
-        print!("{} ", agent.output.prompt_marker());
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            break;
-        }
+        let prompt = format!("{} ", agent.output.prompt_marker());
+        let line = match input::read_line(&prompt, &mut pending_images)? {
+            InputOutcome::Line(line) => line,
+            InputOutcome::Exit => break,
+        };
         let input = line.trim();
         if input.is_empty() && pending_images.is_empty() {
             continue;

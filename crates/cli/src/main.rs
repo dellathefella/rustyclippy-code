@@ -3,6 +3,7 @@
 mod agent;
 mod commands;
 mod images;
+mod input;
 mod subagent_runner;
 mod ui;
 mod wizard;
