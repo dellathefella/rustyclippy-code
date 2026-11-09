@@ -1,21 +1,21 @@
 [package]
-name = "deeprust-cli"
+name = "rustyclippy-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "deeprust command-line coding agent"
+description = "rustyclippy-code command-line coding agent"
 
 [[bin]]
-name = "deeprust"
+name = "rustyclippy-code"
 path = "src/main.rs"
 
 [dependencies]
-deeprust-core = { path = "../core" }
-deeprust-llm = { path = "../llm" }
-deeprust-tools = { path = "../tools" }
+rustyclippy-core = { path = "../core" }
+rustyclippy-llm = { path = "../llm" }
+rustyclippy-tools = { path = "../tools" }
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true

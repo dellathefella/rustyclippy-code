@@ -6,18 +6,18 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use chrono::Utc;
-use deeprust_core::{
+use futures_util::future::join_all;
+use futures_util::StreamExt;
+use rustyclippy_core::{
     compaction::{plan_compaction, summary_instruction, summary_message},
     config::{AgentMode, Config, PermissionMode},
     message::{Message, Role, ToolCall},
     session::{CacheTurnRecord, SessionEvent, SessionMeta, SessionStore},
     system_prompt::{environment_message, system_prompt},
-    CacheEngine, RequestPlan, Transcript,
+    CacheEngine, ImageAttachment, RequestPlan, Transcript,
 };
-use deeprust_llm::{build_provider, LlmRequest, Provider, StreamEvent, Usage};
-use deeprust_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
-use futures_util::future::join_all;
-use futures_util::StreamExt;
+use rustyclippy_llm::{build_provider, LlmRequest, Provider, StreamEvent, Usage};
+use rustyclippy_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
 use serde_json::Value;
 
 use crate::ui::{fmt_num, Output};
@@ -174,19 +174,13 @@ impl Agent {
         let provider = build_provider(&config.provider)?;
         let store = SessionStore::default_store();
         let (meta, events) = store.replay(&session_id)?;
-        let mode = AgentMode::parse(&meta.mode)?;
-        let system = if meta.system_prompt.is_empty() {
+        let mut mode = AgentMode::parse(&meta.mode)?;
+        let mut system = if meta.system_prompt.is_empty() {
             system_prompt(mode)
         } else {
             meta.system_prompt.clone()
         };
-        let registry = ToolRegistry::standard(mode);
-        let mut engine = CacheEngine::new(&system, &registry.schemas(), config.cache.granularity);
-        if engine.tools_hash() != meta.tools_hash {
-            output.warning(
-                "tool schemas changed since this session started; the first resumed request will be cold",
-            );
-        }
+        let mut tools_hash = meta.tools_hash.clone();
 
         let mut transcript = Transcript::new(config.cache.head_messages);
         let mut turn = 0usize;
@@ -197,8 +191,25 @@ impl Agent {
                     transcript.apply_compaction(&record, summary)
                 }
                 SessionEvent::TurnEnd { turn: ended, .. } => turn = ended,
+                SessionEvent::ModeSwitch {
+                    mode: switched,
+                    system_prompt: switched_system,
+                    tools_hash: switched_tools,
+                } => {
+                    mode = AgentMode::parse(&switched)?;
+                    system = switched_system;
+                    tools_hash = switched_tools;
+                }
                 _ => {}
             }
+        }
+
+        let registry = ToolRegistry::standard(mode);
+        let mut engine = CacheEngine::new(&system, &registry.schemas(), config.cache.granularity);
+        if engine.tools_hash() != tools_hash {
+            output.warning(
+                "tool schemas changed since this session started; the first resumed request will be cold",
+            );
         }
 
         if config.cache.assume_warm_resume && !transcript.is_empty() {
@@ -239,11 +250,50 @@ impl Agent {
         })
     }
 
+    /// Switch agent mode in-session. Rebuilds the frozen system prompt and tool
+    /// block, which intentionally invalidates the cached prefix (the next
+    /// request is cold). The transcript is preserved.
+    pub fn switch_mode(&mut self, mode: AgentMode) -> Result<()> {
+        if mode == self.mode {
+            return Ok(());
+        }
+        let system = system_prompt(mode);
+        let registry = ToolRegistry::standard(mode);
+        let engine = CacheEngine::new(&system, &registry.schemas(), self.config.cache.granularity);
+        let tools_hash = engine.tools_hash().to_string();
+        self.system = system.clone();
+        self.registry = registry;
+        self.engine = engine;
+        self.mode = mode;
+        self.config.agent.mode = mode;
+        self.tool_ctx.mode = mode;
+        self.store.append(
+            &self.session_id,
+            &SessionEvent::ModeSwitch {
+                mode: mode.as_str().to_string(),
+                system_prompt: system,
+                tools_hash,
+            },
+        )?;
+        self.output.mode_switch(mode.as_str());
+        Ok(())
+    }
+
     /// Run one user turn to completion.
-    #[allow(unused_assignments)]
     pub async fn run_turn(&mut self, input: &str) -> Result<TurnResult> {
+        self.run_turn_with_images(input, Vec::new()).await
+    }
+
+    /// Run one user turn with optional vision attachments.
+    #[allow(unused_assignments)]
+    pub async fn run_turn_with_images(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+    ) -> Result<TurnResult> {
         self.turn += 1;
-        let user = Message::user(input);
+        self.output.turn_begin(self.turn);
+        let user = Message::user_with_images(input, images);
         self.transcript.append(user.clone());
         self.store
             .append(&self.session_id, &SessionEvent::Message { message: user })?;
@@ -380,6 +430,7 @@ impl Agent {
                     cached_tokens: usage.cached_tokens,
                     prefill_tokens: usage.prefill_tokens(),
                     completion_tokens: usage.completion_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
                     estimated_prompt_tokens: plan.estimated_prompt_tokens,
                     stable_prefix_messages: plan.stable_prefix_messages,
                     prompt_hash: plan.prompt_hash.clone(),

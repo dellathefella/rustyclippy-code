@@ -3,9 +3,11 @@
 /.cargo-home
 
 # Local test state
+/.rustyclippy-code-test
 /.deeprust-test
 
 # Local configuration (may contain private endpoint addresses)
+/rustyclippy-code.json
 /deeprust.json
 
 # OS noise

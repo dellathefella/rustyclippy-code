@@ -1,14 +1,14 @@
 //! Interactive setup wizard.
 //!
 //! Detects an existing DSH harness configuration, probes common local
-//! OpenAI-compatible endpoints, and writes a validated `deeprust.json`.
+//! OpenAI-compatible endpoints, and writes a validated `rustyclippy-code.json`.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use deeprust_core::{
+use rustyclippy_core::{
     session::default_home, Config, PermissionConfig, PermissionMode, ProviderConfig, ProviderKind,
 };
 
@@ -36,7 +36,7 @@ pub async fn run(path: Option<PathBuf>, yes: bool, force: bool) -> Result<()> {
         );
     }
 
-    println!("deeprust setup");
+    println!("rustyclippy-code setup");
     println!("──────────────");
 
     let interactive = !yes && io::stdin().is_terminal();
@@ -181,9 +181,9 @@ pub async fn run(path: Option<PathBuf>, yes: bool, force: bool) -> Result<()> {
             },
             ..ProviderConfig::default()
         },
-        cache: deeprust_core::CacheConfig {
+        cache: rustyclippy_core::CacheConfig {
             autocompact_at_tokens: autocompact,
-            ..deeprust_core::CacheConfig::default()
+            ..rustyclippy_core::CacheConfig::default()
         },
         permissions,
         ..Config::default()
@@ -207,7 +207,9 @@ pub async fn run(path: Option<PathBuf>, yes: bool, force: bool) -> Result<()> {
         config.cache.autocompact_at_tokens
     );
     println!();
-    println!("next: `deeprust doctor` to verify the endpoint, then `deeprust chat`.");
+    println!(
+        "next: `rustyclippy-code doctor` to verify the endpoint, then `rustyclippy-code chat`."
+    );
     Ok(())
 }
 

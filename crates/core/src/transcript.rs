@@ -130,7 +130,7 @@ impl Transcript {
         self.messages
             .first()
             .map(|message| {
-                message.role == Role::User && message.content.starts_with("<environment>")
+                message.role == Role::System && message.content.starts_with("<environment>")
             })
             .unwrap_or(false)
     }

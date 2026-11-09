@@ -1,7 +1,8 @@
-//! deeprust: a cache-stable coding agent tuned for DeepSeek V4.1 Flash.
+//! rustyclippy-code: a cache-stable coding agent tuned for DeepSeek V4.1 Flash.
 
 mod agent;
 mod commands;
+mod images;
 mod subagent_runner;
 mod ui;
 mod wizard;
@@ -10,11 +11,11 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use deeprust_core::Config;
+use rustyclippy_core::Config;
 
 #[derive(Parser)]
 #[command(
-    name = "deeprust",
+    name = "rustyclippy-code",
     version,
     about = "Cache-stable coding agent for DeepSeek V4.1 Flash",
     long_about = "A terminal coding agent that keeps the prompt prefix byte-stable so local \
@@ -22,7 +23,7 @@ use deeprust_core::Config;
                   context every turn."
 )]
 struct Cli {
-    /// Path to a config file (default: ./deeprust.json, then ~/.deeprust/config.json)
+    /// Path to a config file (default: ./rustyclippy-code.json, then ~/.rustyclippy-code/config.json)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// Override the model id
@@ -60,6 +61,9 @@ enum Command {
         /// Override the maximum agent steps
         #[arg(long)]
         max_steps: Option<usize>,
+        /// Attach an image file to the prompt (repeatable)
+        #[arg(long = "image", value_name = "PATH")]
+        images: Vec<PathBuf>,
     },
     /// Interactive REPL
     Chat {
@@ -69,6 +73,14 @@ enum Command {
         mode: Option<String>,
         #[arg(long)]
         yes: bool,
+    },
+    /// Lifetime token usage for a project
+    Stats {
+        /// Project directory (default: current directory)
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Manage sessions
     Sessions {
@@ -121,7 +133,7 @@ enum CacheAction {
 #[derive(Subcommand)]
 enum ConfigAction {
     Init {
-        #[arg(long, default_value = "deeprust.json")]
+        #[arg(long, default_value = "rustyclippy-code.json")]
         path: PathBuf,
         #[arg(long)]
         force: bool,
@@ -168,16 +180,18 @@ async fn run() -> Result<()> {
                     yes,
                     json,
                     max_steps,
+                    images,
                 } => {
                     let text = prompt.join(" ");
                     if text.trim().is_empty() {
                         bail!("`run` needs a prompt");
                     }
-                    commands::run(config, text, session, mode, yes, json, max_steps).await
+                    commands::run(config, text, session, mode, yes, json, max_steps, images).await
                 }
                 Command::Chat { session, mode, yes } => {
                     commands::chat(config, session, mode, yes).await
                 }
+                Command::Stats { project, json } => commands::stats(project, json),
                 Command::Sessions { action } => match action {
                     SessionsAction::List => commands::sessions_list(),
                     SessionsAction::Show { id } => commands::sessions_show(&id),

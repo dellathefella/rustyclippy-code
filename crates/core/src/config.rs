@@ -4,8 +4,8 @@
 //! llama.cpp OpenAI-compatible endpoint). The DeepSeek hosted API is available
 //! as a preset.
 //!
-//! Config is loaded from, in order: an explicit `--config` path, `./deeprust.json`,
-//! `$DEEPRUST_HOME/config.json`, then built-in defaults. Environment variables
+//! Config is loaded from, in order: an explicit `--config` path, `./rustyclippy-code.json`,
+//! `$RUSTYCLIPPY_HOME/config.json`, then built-in defaults. Environment variables
 //! override individual fields.
 
 use std::path::{Path, PathBuf};
@@ -307,12 +307,22 @@ pub struct Config {
     pub web: WebConfig,
 }
 
+fn env_value(name: &str, legacy: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .or_else(|| std::env::var(legacy).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
 impl Config {
     /// Load config from the first available source.
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         let mut config = if let Some(path) = explicit {
             Self::from_file(path)?
+        } else if Path::new("rustyclippy-code.json").exists() {
+            Self::from_file(Path::new("rustyclippy-code.json"))?
         } else if Path::new("deeprust.json").exists() {
+            // Legacy project config from before the rename.
             Self::from_file(Path::new("deeprust.json"))?
         } else {
             let home_config = default_home().join("config.json");
@@ -334,17 +344,17 @@ impl Config {
     }
 
     pub fn apply_env(&mut self) {
-        if let Ok(value) = std::env::var("DEEPRUST_BASE_URL") {
+        if let Some(value) = env_value("RUSTYCLIPPY_BASE_URL", "DEEPRUST_BASE_URL") {
             if !value.trim().is_empty() {
                 self.provider.base_url = value;
             }
         }
-        if let Ok(value) = std::env::var("DEEPRUST_MODEL") {
+        if let Some(value) = env_value("RUSTYCLIPPY_MODEL", "DEEPRUST_MODEL") {
             if !value.trim().is_empty() {
                 self.provider.model = value;
             }
         }
-        if let Ok(value) = std::env::var("DEEPRUST_PROVIDER") {
+        if let Some(value) = env_value("RUSTYCLIPPY_PROVIDER", "DEEPRUST_PROVIDER") {
             match value.trim().to_lowercase().as_str() {
                 "deepseek" => self.provider.kind = ProviderKind::Deepseek,
                 "openai_compat" | "openai" | "local" => {
@@ -353,20 +363,21 @@ impl Config {
                 _ => {}
             }
         }
-        if let Ok(value) = std::env::var("DEEPRUST_MAX_CONTEXT") {
+        if let Some(value) = env_value("RUSTYCLIPPY_MAX_CONTEXT", "DEEPRUST_MAX_CONTEXT") {
             if let Ok(tokens) = value.parse::<usize>() {
                 self.provider.max_context_tokens = tokens;
             }
         }
-        if let Ok(value) = std::env::var("DEEPRUST_AUTOCOMPACT") {
+        if let Some(value) = env_value("RUSTYCLIPPY_AUTOCOMPACT", "DEEPRUST_AUTOCOMPACT") {
             if let Ok(tokens) = value.parse::<usize>() {
                 self.cache.autocompact_at_tokens = tokens;
             }
         }
-        if let Ok(value) = std::env::var("DEEPRUST_REASONING_EFFORT") {
+        if let Some(value) = env_value("RUSTYCLIPPY_REASONING_EFFORT", "DEEPRUST_REASONING_EFFORT")
+        {
             self.provider.reasoning_effort = Some(value);
         }
-        if let Ok(value) = std::env::var("DEEPRUST_MODE") {
+        if let Some(value) = env_value("RUSTYCLIPPY_MODE", "DEEPRUST_MODE") {
             if let Ok(mode) = AgentMode::parse(&value) {
                 self.agent.mode = mode;
             }

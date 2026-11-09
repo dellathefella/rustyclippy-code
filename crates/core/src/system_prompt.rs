@@ -9,12 +9,12 @@ use crate::message::Message;
 
 /// Prompt revision marker. Bump when the prompt text changes so cache
 /// invalidation is explicit rather than accidental.
-pub const PROMPT_VERSION: &str = "deeprust/0.1";
+pub const PROMPT_VERSION: &str = "rustyclippy-code/0.1";
 
 /// Build the frozen system prompt for a mode.
 pub fn system_prompt(mode: AgentMode) -> String {
     let base = format!(
-        r#"You are deeprust ({PROMPT_VERSION}), a coding agent running in the user's terminal.
+        r#"You are rustyclippy-code ({PROMPT_VERSION}), a coding agent running in the user's terminal.
 
 Operating rules:
 - Inspect before editing. Read a file before changing it; never guess file contents.
@@ -52,11 +52,14 @@ Context discipline:
 /// Stable environment context message, appended once at session start.
 ///
 /// Deliberately excludes date/time and anything that changes between turns.
+///
+/// Sent with the `system` role: some vision servers ignore images when a
+/// separate user-role environment message precedes them and tools are present.
 pub fn environment_message(cwd: &str, model: &str) -> Message {
     let platform = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-    Message::user(format!(
+    Message::system(format!(
         "<environment>\ncwd: {cwd}\nplatform: {platform} ({arch})\nshell: {shell}\nmodel: {model}\n</environment>"
     ))
 }
@@ -83,8 +86,9 @@ mod tests {
     }
 
     #[test]
-    fn environment_message_is_tagged() {
+    fn environment_message_is_tagged_and_system_role() {
         let message = environment_message("/tmp", "m");
+        assert_eq!(message.role, crate::message::Role::System);
         assert!(message.content.starts_with("<environment>"));
         assert!(message.content.contains("cwd: /tmp"));
     }

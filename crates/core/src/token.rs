@@ -23,6 +23,11 @@ use crate::message::{Message, Role};
 /// on whole 64-token blocks, so planning floors reuse estimates to this.
 pub const DEEPSEEK_CACHE_GRANULARITY: usize = 64;
 
+/// Conservative per-image token cost. Vision encoders bill by patch count, not
+/// by base64 length; counting the encoded bytes would wildly overestimate the
+/// prompt and trigger unnecessary compaction.
+pub const IMAGE_TOKENS: usize = 1_024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenEstimator {
     /// Characters per token for non-CJK text.
@@ -74,6 +79,7 @@ impl TokenEstimator {
     /// Token cost of one message, including structural overhead.
     pub fn estimate_message(&self, message: &Message) -> usize {
         let mut total = self.estimate_text(&message.content);
+        total += message.images.len() * IMAGE_TOKENS;
         for call in &message.tool_calls {
             total += self.estimate_text(&call.name);
             total += self.estimate_text(&canonical_string(&call.arguments));
@@ -176,5 +182,20 @@ mod tests {
             estimator.observe(100, 10_000);
         }
         assert!(estimator.scale <= 2.5);
+    }
+
+    #[test]
+    fn images_count_a_fixed_cost_not_base64_length() {
+        let estimator = TokenEstimator::default();
+        let plain = Message::user("describe");
+        let with_image = Message::user_with_images(
+            "describe",
+            vec![crate::image::ImageAttachment::from_bytes(
+                "image/png",
+                &[0u8; 4096],
+            )],
+        );
+        let delta = estimator.estimate_message(&with_image) - estimator.estimate_message(&plain);
+        assert_eq!(delta, IMAGE_TOKENS);
     }
 }

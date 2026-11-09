@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use deeprust_core::{AgentMode, Config};
-use deeprust_tools::SubagentRunner;
+use rustyclippy_core::{AgentMode, Config};
+use rustyclippy_tools::SubagentRunner;
 
 use crate::agent::Agent;
 use crate::ui::Output;

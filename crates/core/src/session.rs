@@ -16,15 +16,26 @@ use crate::compaction::CompactionRecord;
 use crate::message::Message;
 
 /// Default home directory for sessions and config.
+///
+/// Falls back to the pre-rename `~/.deeprust` when the new home does not exist,
+/// so existing sessions and configs remain visible after the rename.
 pub fn default_home() -> PathBuf {
-    if let Ok(home) = std::env::var("DEEPRUST_HOME") {
+    if let Ok(home) = std::env::var("RUSTYCLIPPY_HOME").or_else(|_| std::env::var("DEEPRUST_HOME"))
+    {
         if !home.trim().is_empty() {
             return PathBuf::from(home);
         }
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".deeprust")
+    let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let primary = base.join(".rustyclippy-code");
+    if primary.exists() {
+        return primary;
+    }
+    let legacy = base.join(".deeprust");
+    if legacy.exists() {
+        return legacy;
+    }
+    primary
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +79,13 @@ pub enum SessionEvent {
         turn: usize,
         text: String,
     },
+    /// A deliberate in-session mode switch. The system prompt and tool block are
+    /// rebuilt, so the cached prefix is intentionally cold afterwards.
+    ModeSwitch {
+        mode: String,
+        system_prompt: String,
+        tools_hash: String,
+    },
 }
 
 /// Per-turn cache accounting, written to `cache.jsonl`.
@@ -79,6 +97,9 @@ pub struct CacheTurnRecord {
     pub cached_tokens: usize,
     pub prefill_tokens: usize,
     pub completion_tokens: usize,
+    /// Reasoning tokens reported by the provider (subset of completion).
+    #[serde(default)]
+    pub reasoning_tokens: usize,
     pub estimated_prompt_tokens: usize,
     pub stable_prefix_messages: usize,
     pub prompt_hash: String,

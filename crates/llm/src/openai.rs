@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use deeprust_core::{canonical_string, Message, ProviderConfig, ProviderKind, Role};
 use futures_util::{stream::BoxStream, StreamExt};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use rustyclippy_core::{canonical_string, Message, ProviderConfig, ProviderKind, Role};
 use serde_json::{json, Value};
 
 use crate::provider::{LlmRequest, Provider, StreamEvent};
@@ -85,14 +85,25 @@ impl OpenAiProvider {
             .map(|schema| json!({"type": "function", "function": schema}))
             .collect();
 
+        // Vision caveat: MLX servers mishandle images on the streaming path
+        // when tools/system context are present (the model sees a blank or
+        // stale image). Send image requests non-streaming and synthesize the
+        // event stream from the full response instead.
+        let has_images = request
+            .messages
+            .iter()
+            .any(|message| !message.images.is_empty());
+
         let mut body = json!({
             "model": request.model,
             "messages": messages,
-            "stream": true,
-            "stream_options": {"include_usage": true},
+            "stream": !has_images,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
         });
+        if !has_images {
+            body["stream_options"] = json!({"include_usage": true});
+        }
 
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
@@ -103,8 +114,17 @@ impl OpenAiProvider {
 
         // llama.cpp honours `cache_prompt`; DeepSeek caches automatically and
         // rejects unknown fields on some deployments.
-        if self.flavor == Flavor::Generic && request.cache_prompt {
-            body["cache_prompt"] = json!(true);
+        //
+        // Vision caveat: MLX servers key their prefix cache on text tokens and
+        // reuse image placeholder tokens across different images, which makes
+        // the model see a stale/blank image. Disable prefix reuse whenever a
+        // request carries attachments so the image is re-encoded.
+        if self.flavor == Flavor::Generic {
+            if has_images {
+                body["cache_prompt"] = json!(false);
+            } else if request.cache_prompt {
+                body["cache_prompt"] = json!(true);
+            }
         }
 
         // Reasoning effort mirrors the DSH harness knob. Local MLX servers
@@ -112,6 +132,15 @@ impl OpenAiProvider {
         if let Some(effort) = &request.reasoning_effort {
             if !effort.trim().is_empty() && !effort.eq_ignore_ascii_case("off") {
                 body["reasoning_effort"] = json!(effort.trim());
+            }
+        }
+
+        if let Ok(path) = std::env::var("RUSTYCLIPPY_DUMP_REQUEST") {
+            if !path.trim().is_empty() {
+                let _ = std::fs::write(
+                    path,
+                    serde_json::to_string_pretty(&body).unwrap_or_default(),
+                );
             }
         }
 
@@ -129,6 +158,10 @@ impl Provider for OpenAiProvider {
     }
 
     async fn stream(&self, request: LlmRequest) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        let has_images = request
+            .messages
+            .iter()
+            .any(|message| !message.images.is_empty());
         let body = self.build_body(&request);
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -154,6 +187,67 @@ impl Provider for OpenAiProvider {
                 "provider returned HTTP {status}: {}",
                 truncate(&text, 2_000)
             );
+        }
+
+        // Image requests are sent non-streaming (see `build_body`); turn the
+        // complete response into the same event sequence the SSE path emits.
+        if has_images {
+            let text = response.text().await.unwrap_or_default();
+            let value: Value = serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "parsing non-streaming vision response: {}",
+                    truncate(&text, 500)
+                )
+            })?;
+            let stream = async_stream::try_stream! {
+                if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+                    for choice in choices {
+                        let message = choice.get("message").unwrap_or(&Value::Null);
+                        if let Some(reasoning) =
+                            message.get("reasoning_content").and_then(|v| v.as_str())
+                        {
+                            if !reasoning.is_empty() {
+                                yield StreamEvent::Reasoning(reasoning.to_string());
+                            }
+                        }
+                        if let Some(content) = message.get("content").and_then(|v| v.as_str()) {
+                            if !content.is_empty() {
+                                yield StreamEvent::Text(content.to_string());
+                            }
+                        }
+                        if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                            for (index, call) in calls.iter().enumerate() {
+                                let id = call
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let function = call.get("function");
+                                let name = function
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let args = function
+                                    .and_then(|f| f.get("arguments"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                yield StreamEvent::ToolCallDelta {
+                                    index,
+                                    id,
+                                    name,
+                                    args_fragment: args,
+                                };
+                            }
+                        }
+                    }
+                }
+                if let Some(usage_value) = value.get("usage") {
+                    if usage_value.is_object() {
+                        yield StreamEvent::Usage(parse_usage(usage_value));
+                    }
+                }
+                yield StreamEvent::Done;
+            };
+            return Ok(Box::pin(stream));
         }
 
         let mut bytes = response.bytes_stream();
@@ -281,7 +375,7 @@ fn to_openai_message(message: &Message) -> Value {
             "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
             "content": message.content,
         }),
-        Role::User => json!({"role": "user", "content": message.content}),
+        Role::User => json!({"role": "user", "content": message.content_value()}),
         Role::System => json!({"role": "system", "content": message.content}),
     }
 }
@@ -300,7 +394,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deeprust_core::ToolCall;
+    use rustyclippy_core::ToolCall;
 
     fn provider() -> OpenAiProvider {
         OpenAiProvider::new(&ProviderConfig::local_mlx(None, None)).unwrap()
@@ -362,5 +456,53 @@ mod tests {
             reasoning_effort: None,
         };
         assert_eq!(provider.build_body(&request)["tool_choice"], "none");
+    }
+
+    #[test]
+    fn user_images_become_content_parts() {
+        let message = Message::user_with_images(
+            "what is this?",
+            vec![rustyclippy_core::ImageAttachment::from_bytes(
+                "image/png",
+                b"abc",
+            )],
+        );
+        let wire = to_openai_message(&message);
+        assert_eq!(wire["content"][0]["type"], "text");
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("what is this?"));
+        assert!(text.chars().any(|ch| ch == '\u{200B}' || ch == '\u{200C}'));
+        assert_eq!(wire["content"][1]["type"], "image_url");
+        assert_eq!(
+            wire["content"][1]["image_url"]["url"],
+            "data:image/png;base64,YWJj"
+        );
+    }
+
+    #[test]
+    fn images_disable_prefix_cache() {
+        let provider = provider();
+        let request = LlmRequest {
+            model: "m".into(),
+            system: "s".into(),
+            tools: vec![],
+            messages: vec![Message::user_with_images(
+                "look",
+                vec![rustyclippy_core::ImageAttachment::from_bytes(
+                    "image/png",
+                    b"abc",
+                )],
+            )],
+            max_tokens: 10,
+            temperature: 0.0,
+            cache_prompt: true,
+            breakpoints: vec![],
+            tool_choice_none: false,
+            reasoning_effort: None,
+        };
+        let body = provider.build_body(&request);
+        assert_eq!(body["cache_prompt"], false);
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
     }
 }

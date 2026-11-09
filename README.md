@@ -1,4 +1,4 @@
-# deeprust
+# rustyclippy-code
 
 A Rust coding agent for **DeepSeek V4.1 Flash** that keeps its prompt prefix
 byte-stable, so a local inference server reuses its KV cache instead of
@@ -8,7 +8,7 @@ Local models are expensive to prefill. Most agent harnesses silently invalidate
 the prefix on every turn — a fresh timestamp in the system prompt, a reordered
 tool list, a re-rendered environment block, or a history rewrite during
 compaction. The server then has to re-prefill tens of thousands of tokens before
-it can emit a single one. `deeprust` treats prefix stability as a measured,
+it can emit a single one. `rustyclippy-code` treats prefix stability as a measured,
 enforced invariant.
 
 ## Measured effect
@@ -17,8 +17,8 @@ Real run against a local MLX server serving
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`:
 
 ```text
-[turn 1 step 1] prompt=2,275 cached=0     (0.0%) prefill=2,275 out=21 | cache cold
-[turn 1 step 2] prompt=2,340 cached=2,274 (97.2%) prefill=66    out=56 | prefix stable ✓
+  · turn 1 step 1 · prompt=2,275 cached=0 (0.0%) prefill=2,275 out=21 · cache cold
+  · turn 1 step 2 · prompt=2,340 cached=2,274 (97.2%) prefill=66 out=56 · prefix stable ✓
 ```
 
 The second step reused **97.2%** of the prompt. Only the 66 new tokens were
@@ -30,31 +30,100 @@ prefilled.
 cargo build --release
 
 # Detect your local endpoint, model and reasoning effort, then write a config.
-./target/release/deeprust setup
+./target/release/rustyclippy-code setup
 
 # Verify the endpoint answers.
-./target/release/deeprust doctor
+./target/release/rustyclippy-code doctor
 
 # Interactive REPL.
-./target/release/deeprust chat
+./target/release/rustyclippy-code chat
 ```
 
 The setup wizard reads an existing DSH harness configuration when present
 (`~/.dsh/vscode/harness-home/settings.yaml`), probes common local endpoints, and
 asks for the model, reasoning effort, and permission policy.
 
+## REPL
+
+The interactive surface is opencode-inspired: a header with model, mode,
+endpoint, session and cwd; a dim rule before every answer; a left rail on the
+assistant stream; `●` / `└` markers for tool calls and results; and a footer with
+the turn's cache accounting. Chrome is written to stderr, assistant text to
+stdout, so piped output stays clean.
+
+```text
+▌ rustyclippy-code 0.1.0
+  model    ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw
+  mode     build
+  endpoint http://127.0.0.1:11234/v1
+  session  20261109-222137-70f8b3
+  cwd      /Users/jdella/project
+──────────────────────────────────────────────────────────────
+
+› explain the cache guard
+──────────────────────────────────────────────────────────────
+▌ assistant · turn 1
+│ The cache guard hashes every message before each request…
+│
+  ● read  {"path":"crates/core/src/cache.rs"}
+  └ fn guard(&self, plan: &RequestPlan) -> Result<()> {
+  · turn 1 step 1 · prompt=2,340 cached=2,274 (97.2%) prefill=66 out=56 · prefix reused ✓
+── turn 1 · 1 steps · prompt=2,340 cached=2,274 (97.2%) prefill=66 out=56 ──
+```
+
+Slash commands:
+
+```text
+/exit          quit
+/session       show session id
+/cache         per-turn cache report
+/stats         lifetime token usage for this project
+/new           start a fresh session
+/mode [build|plan]  show or switch agent mode
+/paste         attach the clipboard image to the next prompt
+/image <path>  attach an image file to the next prompt
+/images        list pending attachments
+/clear-images  drop pending attachments
+/help          command list
+```
+
+`/mode` rebuilds the frozen system prompt and tool block, so it intentionally
+resets the cached prefix: the next request is cold and re-prefills once. The
+switch is recorded in the session log and replayed on resume.
+
+### Images
+
+Vision-capable servers accept images attached to a prompt. `/paste` reads the
+clipboard image through native tooling (`pngpaste`/AppleScript on macOS,
+`wl-paste`/`xclip` on Linux, PowerShell on Windows); `/image <path>` attaches a
+file; a pasted or dragged image path in the prompt is detected automatically.
+Images travel as base64 `data:` URLs in the OpenAI-compatible content-parts
+shape, so they stay part of the byte-stable prefix.
+
+Local MLX servers have two vision quirks that the provider works around: they
+ignore images on the streaming path when tools/system context are present, and
+they reuse cached image placeholder tokens across different images. Image turns
+are therefore sent non-streaming with prefix reuse disabled, and the text part
+carries an invisible zero-width fingerprint so a new image never hits a stale
+cached prefix.
+
 ## Commands
 
 ```text
-deeprust setup [--yes] [--force] [--path <file>]   interactive setup wizard (alias: init)
-deeprust doctor                                    check endpoint and effective config
-deeprust chat [--session <id>] [--mode build|plan] interactive REPL
-deeprust run <prompt> [--session <id>] [--json] [--yes] [--max-steps N]
-deeprust sessions list|show <id>|delete <id>
-deeprust cache report [--session <id>] [--json]
-deeprust config init [--path <file>] [--force]
-deeprust config show
+rustyclippy-code setup [--yes] [--force] [--path <file>]   interactive setup wizard (alias: init)
+rustyclippy-code doctor                                    check endpoint and effective config
+rustyclippy-code chat [--session <id>] [--mode build|plan] interactive REPL
+rustyclippy-code run <prompt> [--image <path>]... [--session <id>] [--json] [--yes] [--max-steps N]
+rustyclippy-code stats [--project <path>] [--json]         lifetime token usage for a project
+rustyclippy-code sessions list|show <id>|delete <id>
+rustyclippy-code cache report [--session <id>] [--json]
+rustyclippy-code config init [--path <file>] [--force]
+rustyclippy-code config show
 ```
+
+`stats` aggregates every session whose recorded cwd matches the project (the
+current directory by default): sessions, turns, prompt/cached/prefill/output/
+reasoning tokens, cache-hit ratio, and a per-model breakdown.
 
 Global overrides: `--config <file>`, `--model <id>`, `--base-url <url>`,
 `--reasoning-effort off|low|high|max`.
@@ -93,7 +162,8 @@ The full rationale is in [`docs/CACHE.md`](docs/CACHE.md). The invariants:
    mid-session.
 3. **Append-only transcript.** `Transcript` exposes no way to mutate a message.
 4. **Volatile context appended once.** cwd/platform/shell/model go into a single
-   `<environment>` message at session start, never into the system prompt.
+   `<environment>` system-role message at session start, never into the system
+   prompt.
 5. **Prefix-anchored compaction.** At 250k tokens the agent keeps the pinned head
    (environment + original task) byte-identical, summarizes the middle, and keeps
    the recent tail. The cached head survives; only the summary and tail are
@@ -128,12 +198,12 @@ The head bytes never change, which is what lets the KV cache survive compaction.
 
 ## Configuration
 
-`deeprust.json` (project) → `~/.deeprust/config.json` → defaults. Environment
-overrides: `DEEPRUST_BASE_URL`, `DEEPRUST_MODEL`, `DEEPRUST_PROVIDER`,
-`DEEPRUST_MAX_CONTEXT`, `DEEPRUST_AUTOCOMPACT`, `DEEPRUST_REASONING_EFFORT`,
-`DEEPRUST_MODE`, `DEEPRUST_HOME`.
+`rustyclippy-code.json` (project) → `~/.rustyclippy-code/config.json` → defaults. Environment
+overrides: `RUSTYCLIPPY_BASE_URL`, `RUSTYCLIPPY_MODEL`, `RUSTYCLIPPY_PROVIDER`,
+`RUSTYCLIPPY_MAX_CONTEXT`, `RUSTYCLIPPY_AUTOCOMPACT`, `RUSTYCLIPPY_REASONING_EFFORT`,
+`RUSTYCLIPPY_MODE`, `RUSTYCLIPPY_HOME`.
 
-See [`deeprust.example.json`](deeprust.example.json) for every field.
+See [`rustyclippy-code.example.json`](rustyclippy-code.example.json) for every field.
 
 ## Architecture
 

@@ -1,18 +1,23 @@
 //! CLI command implementations.
 
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use deeprust_core::{AgentMode, CacheTurnRecord, Config, SessionStore, SessionSummary};
-use deeprust_tools::SubagentRunner;
+use rustyclippy_core::{
+    AgentMode, CacheTurnRecord, Config, ImageAttachment, SessionStore, SessionSummary,
+};
+use rustyclippy_tools::SubagentRunner;
 
 use crate::agent::{Agent, TurnResult};
+use crate::images;
 use crate::subagent_runner::CliSubagentRunner;
-use crate::ui::{fmt_num, Output};
+use crate::ui::{fmt_bytes, fmt_num, Output};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
     prompt: String,
@@ -21,6 +26,7 @@ pub async fn run(
     yes: bool,
     json: bool,
     max_steps: Option<usize>,
+    image_paths: Vec<PathBuf>,
 ) -> Result<()> {
     let mut config = config;
     if let Some(mode) = mode {
@@ -34,19 +40,26 @@ pub async fn run(
     let runner: Arc<dyn SubagentRunner> =
         Arc::new(CliSubagentRunner::new(config.clone(), cwd.clone(), yes));
 
+    let mut attachments = Vec::with_capacity(image_paths.len());
+    for path in &image_paths {
+        attachments.push(images::read_image(path)?);
+    }
+
     let mut agent = match session {
         Some(id) => Agent::resume(config, id, output.clone(), yes, Some(runner))?,
         None => Agent::new_session(config, cwd, output.clone(), yes, Some(runner))?,
     };
 
-    agent.output.banner(
+    agent.output.header(
+        env!("CARGO_PKG_VERSION"),
         &agent.session_id,
         &agent.config.provider.model,
         agent.mode.as_str(),
         &agent.config.provider.base_url,
+        &agent.tool_ctx.cwd.to_string_lossy(),
     );
 
-    let result = agent.run_turn(&prompt).await?;
+    let result = agent.run_turn_with_images(&prompt, attachments).await?;
 
     if json {
         println!(
@@ -55,7 +68,9 @@ pub async fn run(
         );
     } else {
         println!();
-        agent.output.turn_summary(&result.usage, result.steps);
+        agent
+            .output
+            .turn_summary(agent.turn, &result.usage, result.steps);
     }
     Ok(())
 }
@@ -70,7 +85,7 @@ pub async fn chat(
     if let Some(mode) = mode {
         config.agent.mode = AgentMode::parse(&mode)?;
     }
-    let output = Output::new(false);
+    let output = Output::chat();
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let runner: Arc<dyn SubagentRunner> =
         Arc::new(CliSubagentRunner::new(config.clone(), cwd.clone(), yes));
@@ -92,64 +107,234 @@ pub async fn chat(
         )?,
     };
 
-    agent.output.banner(
-        &agent.session_id,
-        &agent.config.provider.model,
-        agent.mode.as_str(),
-        &agent.config.provider.base_url,
+    print_header(&agent);
+    agent.output.hint(
+        "commands: /exit /session /cache /stats /new /mode build|plan /paste /image <path> /clear-images /help",
     );
-    eprintln!("commands: /exit /session /cache /new /help");
+
+    let context = ChatContext {
+        cwd: &cwd,
+        yes,
+        runner: &runner,
+    };
+    let mut pending_images: Vec<ImageAttachment> = Vec::new();
 
     loop {
-        print!("› ");
+        if !pending_images.is_empty() {
+            agent.output.pending_images(pending_images.len());
+        }
+        print!("{} ", agent.output.prompt_marker());
         let _ = io::stdout().flush();
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
             break;
         }
         let input = line.trim();
-        if input.is_empty() {
+        if input.is_empty() && pending_images.is_empty() {
             continue;
         }
 
-        match input {
-            "/exit" | "/quit" => break,
-            "/help" => {
-                eprintln!(
-                    "/exit  quit\n/session  show session id\n/cache  show cache report\n/new  start a new session\n/help  this message"
-                );
+        if input.starts_with('/') {
+            match handle_command(&mut agent, input, &mut pending_images, &context)? {
+                CommandOutcome::Exit => break,
+                CommandOutcome::Continue => continue,
             }
-            "/session" => eprintln!("session: {}", agent.session_id),
-            "/cache" => print_cache_report(&agent.store, &agent.session_id, false)?,
-            "/new" => {
-                agent = Agent::new_session(
-                    config.clone(),
-                    cwd.clone(),
-                    output.clone(),
-                    yes,
-                    Some(runner.clone()),
-                )?;
-                agent.output.banner(
-                    &agent.session_id,
-                    &agent.config.provider.model,
-                    agent.mode.as_str(),
-                    &agent.config.provider.base_url,
-                );
+        }
+
+        let (prompt, inline_images) = extract_image_paths(input);
+        pending_images.extend(inline_images);
+        let images = std::mem::take(&mut pending_images);
+        match agent.run_turn_with_images(&prompt, images).await {
+            Ok(result) => {
+                println!();
+                agent
+                    .output
+                    .turn_summary(agent.turn, &result.usage, result.steps);
             }
-            "/mode" => eprintln!(
-                "mode changes rewrite the frozen system prompt and tool block, so they would \
-                 invalidate the cached prefix. Start a new session with --mode instead."
-            ),
-            _ => match agent.run_turn(input).await {
-                Ok(result) => {
-                    println!();
-                    agent.output.turn_summary(&result.usage, result.steps);
-                }
-                Err(error) => agent.output.error(&format!("{error:#}")),
-            },
+            Err(error) => agent.output.error(&format!("{error:#}")),
         }
     }
     Ok(())
+}
+
+struct ChatContext<'a> {
+    cwd: &'a Path,
+    yes: bool,
+    runner: &'a Arc<dyn SubagentRunner>,
+}
+
+enum CommandOutcome {
+    Continue,
+    Exit,
+}
+
+fn print_header(agent: &Agent) {
+    agent.output.header(
+        env!("CARGO_PKG_VERSION"),
+        &agent.session_id,
+        &agent.config.provider.model,
+        agent.mode.as_str(),
+        &agent.config.provider.base_url,
+        &agent.tool_ctx.cwd.to_string_lossy(),
+    );
+}
+
+fn handle_command(
+    agent: &mut Agent,
+    input: &str,
+    pending_images: &mut Vec<ImageAttachment>,
+    context: &ChatContext<'_>,
+) -> Result<CommandOutcome> {
+    let mut parts = input.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+
+    match command {
+        "/exit" | "/quit" => Ok(CommandOutcome::Exit),
+        "/help" => {
+            agent.output.hint(
+                "/exit          quit\n\
+                 /session       show session id\n\
+                 /cache         per-turn cache report\n\
+                 /stats         lifetime token usage for this project\n\
+                 /new           start a fresh session\n\
+                 /mode [build|plan]  show or switch agent mode\n\
+                 /paste         attach the clipboard image to the next prompt\n\
+                 /image <path>  attach an image file to the next prompt\n\
+                 /images        list pending attachments\n\
+                 /clear-images  drop pending attachments\n\
+                 /help          this message",
+            );
+            Ok(CommandOutcome::Continue)
+        }
+        "/session" => {
+            agent.output.hint(&format!("session: {}", agent.session_id));
+            Ok(CommandOutcome::Continue)
+        }
+        "/cache" => {
+            print_cache_report(&agent.store, &agent.session_id, false)?;
+            Ok(CommandOutcome::Continue)
+        }
+        "/stats" => {
+            print_project_stats(&agent.store, &agent.tool_ctx.cwd, false)?;
+            Ok(CommandOutcome::Continue)
+        }
+        "/new" => {
+            let output = agent.output.clone();
+            let config = agent.config.clone();
+            *agent = Agent::new_session(
+                config,
+                context.cwd.to_path_buf(),
+                output,
+                context.yes,
+                Some(context.runner.clone()),
+            )?;
+            pending_images.clear();
+            print_header(agent);
+            Ok(CommandOutcome::Continue)
+        }
+        "/mode" => {
+            if rest.is_empty() {
+                agent.output.hint(&format!("mode: {}", agent.mode.as_str()));
+            } else {
+                match AgentMode::parse(rest) {
+                    Ok(new_mode) => {
+                        agent.switch_mode(new_mode)?;
+                        print_header(agent);
+                    }
+                    Err(error) => agent.output.error(&format!("{error:#}")),
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        }
+        "/paste" => {
+            match images::capture_clipboard() {
+                Ok(Some(image)) => {
+                    agent
+                        .output
+                        .image_attached(&image.mime, image.approx_bytes());
+                    pending_images.push(image);
+                }
+                Ok(None) => agent
+                    .output
+                    .warning("clipboard has no image (copy a screenshot or image first)"),
+                Err(error) => agent.output.error(&format!("{error:#}")),
+            }
+            Ok(CommandOutcome::Continue)
+        }
+        "/image" => {
+            if rest.is_empty() {
+                agent.output.error("/image needs a file path");
+            } else {
+                match images::read_image(Path::new(rest)) {
+                    Ok(image) => {
+                        agent
+                            .output
+                            .image_attached(&image.mime, image.approx_bytes());
+                        pending_images.push(image);
+                    }
+                    Err(error) => agent.output.error(&format!("{error:#}")),
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        }
+        "/images" => {
+            if pending_images.is_empty() {
+                agent.output.hint("no images attached");
+            } else {
+                for image in pending_images.iter() {
+                    agent.output.hint(&format!(
+                        "{} · {}",
+                        image.mime,
+                        fmt_bytes(image.approx_bytes())
+                    ));
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        }
+        "/clear-images" => {
+            pending_images.clear();
+            agent.output.hint("cleared pending images");
+            Ok(CommandOutcome::Continue)
+        }
+        other => {
+            agent
+                .output
+                .error(&format!("unknown command `{other}` (try /help)"));
+            Ok(CommandOutcome::Continue)
+        }
+    }
+}
+
+/// Drag-and-drop / pasted image paths are attached instead of sent as text.
+fn extract_image_paths(input: &str) -> (String, Vec<ImageAttachment>) {
+    let mut kept: Vec<String> = Vec::new();
+    let mut attachments = Vec::new();
+    for token in input.split_whitespace() {
+        let path = Path::new(token);
+        if is_image_path(path) && path.is_file() {
+            match images::read_image(path) {
+                Ok(image) => attachments.push(image),
+                Err(error) => {
+                    eprintln!("warning: {error:#}");
+                    kept.push(token.to_string());
+                }
+            }
+        } else {
+            kept.push(token.to_string());
+        }
+    }
+    (kept.join(" "), attachments)
+}
+
+fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif")
+    )
 }
 
 pub fn sessions_list() -> Result<()> {
@@ -176,7 +361,7 @@ pub fn sessions_show(id: &str) -> Result<()> {
     println!("tools:      {}", short_hash(&meta.tools_hash));
     let messages = events
         .iter()
-        .filter(|event| matches!(event, deeprust_core::SessionEvent::Message { .. }))
+        .filter(|event| matches!(event, rustyclippy_core::SessionEvent::Message { .. }))
         .count();
     println!("messages:   {messages}");
     println!();
@@ -197,6 +382,138 @@ pub fn cache_report(session: Option<String>, json: bool) -> Result<()> {
         Some(id) => print_cache_report(&store, &id, json),
         None => aggregate_report(&store, json),
     }
+}
+
+/// Lifetime token usage for every session recorded in one project directory.
+pub fn stats(project: Option<PathBuf>, json: bool) -> Result<()> {
+    let store = SessionStore::default_store();
+    let root = match project {
+        Some(path) => path,
+        None => std::env::current_dir().context("resolving current directory")?,
+    };
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    print_project_stats(&store, &root, json)
+}
+
+#[derive(Default)]
+struct ProjectTotals {
+    sessions: usize,
+    turns: usize,
+    prompt_tokens: usize,
+    cached_tokens: usize,
+    prefill_tokens: usize,
+    completion_tokens: usize,
+    reasoning_tokens: usize,
+}
+
+impl ProjectTotals {
+    fn add(&mut self, record: &CacheTurnRecord) {
+        self.prompt_tokens += record.prompt_tokens;
+        self.cached_tokens += record.cached_tokens;
+        self.prefill_tokens += record.prefill_tokens;
+        self.completion_tokens += record.completion_tokens;
+        self.reasoning_tokens += record.reasoning_tokens;
+    }
+
+    fn hit_ratio(&self) -> f64 {
+        if self.prompt_tokens == 0 {
+            0.0
+        } else {
+            self.cached_tokens as f64 / self.prompt_tokens as f64
+        }
+    }
+}
+
+fn print_project_stats(store: &SessionStore, root: &Path, json: bool) -> Result<()> {
+    let sessions = store.list()?;
+    let mut totals = ProjectTotals::default();
+    let mut models: BTreeMap<String, ProjectTotals> = BTreeMap::new();
+
+    for session in &sessions {
+        let cwd =
+            std::fs::canonicalize(&session.cwd).unwrap_or_else(|_| PathBuf::from(&session.cwd));
+        if cwd != root {
+            continue;
+        }
+        let records = store.load_cache(&session.id)?;
+        totals.sessions += 1;
+        totals.turns += records.len();
+        for record in &records {
+            totals.add(record);
+        }
+        let model = models.entry(session.model.clone()).or_default();
+        model.sessions += 1;
+        model.turns += records.len();
+        for record in &records {
+            model.add(record);
+        }
+    }
+
+    if json {
+        let payload = serde_json::json!({
+            "project": root.to_string_lossy(),
+            "sessions": totals.sessions,
+            "turns": totals.turns,
+            "prompt_tokens": totals.prompt_tokens,
+            "cached_tokens": totals.cached_tokens,
+            "prefill_tokens": totals.prefill_tokens,
+            "completion_tokens": totals.completion_tokens,
+            "reasoning_tokens": totals.reasoning_tokens,
+            "cache_hit_ratio": totals.hit_ratio(),
+            "models": models.iter().map(|(model, totals)| serde_json::json!({
+                "model": model,
+                "sessions": totals.sessions,
+                "turns": totals.turns,
+                "prompt_tokens": totals.prompt_tokens,
+                "cached_tokens": totals.cached_tokens,
+                "prefill_tokens": totals.prefill_tokens,
+                "completion_tokens": totals.completion_tokens,
+                "reasoning_tokens": totals.reasoning_tokens,
+                "cache_hit_ratio": totals.hit_ratio(),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    println!("project:  {}", root.display());
+    println!("sessions: {}", totals.sessions);
+    println!("turns:    {}", totals.turns);
+    if totals.sessions == 0 {
+        println!();
+        println!("no sessions recorded for this project yet");
+        return Ok(());
+    }
+    println!();
+    println!(
+        "tokens:   prompt={} cached={} ({:.1}%) prefill={} output={} reasoning={}",
+        fmt_num(totals.prompt_tokens),
+        fmt_num(totals.cached_tokens),
+        totals.hit_ratio() * 100.0,
+        fmt_num(totals.prefill_tokens),
+        fmt_num(totals.completion_tokens),
+        fmt_num(totals.reasoning_tokens)
+    );
+    println!();
+    println!("by model:");
+    println!(
+        "  {:<56} {:>8} {:>6} {:>10} {:>10} {:>7} {:>10} {:>8}",
+        "model", "sessions", "turns", "prompt", "cached", "hit%", "prefill", "out"
+    );
+    for (model, totals) in &models {
+        println!(
+            "  {:<56} {:>8} {:>6} {:>10} {:>10} {:>6.1}% {:>10} {:>8}",
+            model,
+            totals.sessions,
+            totals.turns,
+            fmt_num(totals.prompt_tokens),
+            fmt_num(totals.cached_tokens),
+            totals.hit_ratio() * 100.0,
+            fmt_num(totals.prefill_tokens),
+            fmt_num(totals.completion_tokens)
+        );
+    }
+    Ok(())
 }
 
 fn print_cache_report(store: &SessionStore, session_id: &str, json: bool) -> Result<()> {
@@ -296,6 +613,7 @@ fn print_aggregate(records: &[CacheTurnRecord]) {
     let cached: usize = records.iter().map(|record| record.cached_tokens).sum();
     let prefill: usize = records.iter().map(|record| record.prefill_tokens).sum();
     let output: usize = records.iter().map(|record| record.completion_tokens).sum();
+    let reasoning: usize = records.iter().map(|record| record.reasoning_tokens).sum();
     let unstable = records.iter().filter(|record| !record.stable).count();
     let ratio = if prompt == 0 {
         0.0
@@ -304,12 +622,13 @@ fn print_aggregate(records: &[CacheTurnRecord]) {
     };
     println!();
     println!(
-        "total: prompt={} cached={} ({:.1}%) prefill={} out={} unstable_turns={}",
+        "total: prompt={} cached={} ({:.1}%) prefill={} out={} reasoning={} unstable_turns={}",
         fmt_num(prompt),
         fmt_num(cached),
         ratio,
         fmt_num(prefill),
         fmt_num(output),
+        fmt_num(reasoning),
         unstable
     );
 }
@@ -326,7 +645,7 @@ pub fn config_show(config: &Config) -> Result<()> {
 }
 
 pub async fn doctor(config: &Config) -> Result<()> {
-    println!("deeprust doctor");
+    println!("rustyclippy-code doctor");
     println!("  provider:        {}", config.provider.kind.as_str());
     println!("  base_url:        {}", config.provider.base_url);
     println!("  model:           {}", config.provider.model);
@@ -353,7 +672,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
     println!("  cache granularity: {} tokens", config.cache.granularity);
     println!(
         "  tools:           {}",
-        deeprust_tools::ToolRegistry::standard(config.agent.mode).len()
+        rustyclippy_tools::ToolRegistry::standard(config.agent.mode).len()
     );
     println!();
 
@@ -388,7 +707,7 @@ pub async fn doctor(config: &Config) -> Result<()> {
             println!("  endpoint:        unreachable ({url})");
             println!("  error:           {error}");
             println!(
-                "  hint:            start the local server or run `deeprust setup` to detect it"
+                "  hint:            start the local server or run `rustyclippy-code setup` to detect it"
             );
         }
     }

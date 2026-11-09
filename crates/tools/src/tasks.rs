@@ -354,7 +354,7 @@ impl Tool for WaitTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deeprust_core::AgentMode;
+    use rustyclippy_core::AgentMode;
 
     fn context() -> ToolContext {
         ToolContext::new(PathBuf::from("/tmp"), AgentMode::Build)

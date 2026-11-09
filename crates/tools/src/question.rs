@@ -105,7 +105,7 @@ impl Tool for QuestionTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deeprust_core::AgentMode;
+    use rustyclippy_core::AgentMode;
     use std::path::PathBuf;
 
     #[tokio::test]
