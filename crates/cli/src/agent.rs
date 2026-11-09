@@ -333,6 +333,9 @@ impl Agent {
                 }
             }
 
+            if !text.is_empty() {
+                self.output.line_break();
+            }
             let tool_calls = assembler.finish();
             self.engine.commit(self.transcript.messages());
             self.engine

@@ -113,11 +113,22 @@ impl Output {
     }
 
     /// Per-request cache accounting.
+    /// Finish a streamed assistant message with a newline before the metrics line.
+    pub fn line_break(&self) {
+        if !self.json && !self.quiet {
+            println!();
+        }
+    }
+
     pub fn metrics(&self, turn: usize, step: usize, plan: &RequestPlan, usage: &Usage) {
         if self.silent() {
             return;
         }
-        let prompt = usage.prompt_tokens.max(plan.estimated_prompt_tokens);
+        let prompt = if usage.prompt_tokens > 0 {
+            usage.prompt_tokens
+        } else {
+            plan.estimated_prompt_tokens
+        };
         let cached = usage.cached_tokens;
         let prefill = usage.prefill_tokens();
         let ratio = if prompt == 0 {
@@ -125,7 +136,11 @@ impl Output {
         } else {
             cached as f64 / prompt as f64
         };
-        let status = if plan.cache_cold {
+        // Report what the server actually did, not just what the local snapshot
+        // predicted: a fresh session can still hit a warm server cache.
+        let status = if cached > 0 {
+            self.paint(GREEN, "prefix reused ✓")
+        } else if plan.cache_cold {
             self.paint(YELLOW, "cache cold")
         } else if plan.stable {
             self.paint(GREEN, "prefix stable ✓")
