@@ -56,12 +56,75 @@ pub enum NoticeLevel {
     Error,
 }
 
+/// What the user chose at a permission prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalAnswer {
+    Yes,
+    No,
+    Session,
+    Select,
+}
+
+/// A batch of tool calls waiting for the user's approval.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// `(tool name, human detail)` for each call in the batch.
+    pub calls: Vec<(String, String)>,
+}
+
+impl ApprovalRequest {
+    pub fn is_batch(&self) -> bool {
+        self.calls.len() > 1
+    }
+}
+
+/// Session identity the TUI draws in its header.
+#[derive(Debug, Clone)]
+pub struct HeaderInfo {
+    pub version: String,
+    pub session: String,
+    pub model: String,
+    pub mode: String,
+    pub base_url: String,
+    pub cwd: String,
+}
+
+/// Running token totals for the footer.
+#[derive(Debug, Default, Clone)]
+pub struct Totals {
+    pub turns: usize,
+    pub prompt: usize,
+    pub cached: usize,
+    pub prefill: usize,
+    pub completion: usize,
+}
+
+impl Totals {
+    pub fn hit_ratio(&self) -> f64 {
+        if self.prompt == 0 {
+            0.0
+        } else {
+            self.cached as f64 / self.prompt as f64
+        }
+    }
+}
+
 /// Shared transcript buffer the agent writes into and the TUI reads.
 #[derive(Debug, Default)]
 pub struct UiFeed {
     entries: Vec<FeedEntry>,
     /// Bumped on every push so the renderer knows to redraw.
     revision: u64,
+    /// Set while the agent is blocked waiting for an approval answer.
+    approval: Option<ApprovalRequest>,
+    /// Channel the renderer uses to deliver the answer.
+    approval_tx: Option<tokio::sync::oneshot::Sender<ApprovalAnswer>>,
+    /// Live session identity for the header.
+    header: Option<HeaderInfo>,
+    /// Running token totals for the footer.
+    totals: Totals,
+    /// True while a turn is in flight.
+    busy: bool,
 }
 
 impl UiFeed {
@@ -81,6 +144,63 @@ impl UiFeed {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.revision += 1;
+    }
+
+    pub fn set_header(&mut self, header: HeaderInfo) {
+        self.header = Some(header);
+        self.revision += 1;
+    }
+
+    pub fn header(&self) -> Option<&HeaderInfo> {
+        self.header.as_ref()
+    }
+
+    pub fn totals(&self) -> &Totals {
+        &self.totals
+    }
+
+    pub fn add_turn(&mut self, prompt: usize, cached: usize, prefill: usize, completion: usize) {
+        self.totals.turns += 1;
+        self.totals.prompt += prompt;
+        self.totals.cached += cached;
+        self.totals.prefill += prefill;
+        self.totals.completion += completion;
+        self.revision += 1;
+    }
+
+    pub fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+        self.revision += 1;
+    }
+
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    /// Register a pending approval request and the channel that answers it.
+    pub fn request_approval(
+        &mut self,
+        request: ApprovalRequest,
+        tx: tokio::sync::oneshot::Sender<ApprovalAnswer>,
+    ) {
+        self.approval = Some(request);
+        self.approval_tx = Some(tx);
+        self.revision += 1;
+    }
+
+    pub fn pending_approval(&self) -> Option<&ApprovalRequest> {
+        self.approval.as_ref()
+    }
+
+    /// Deliver the user's answer to the blocked agent. Returns false when no
+    /// request is pending.
+    pub fn answer_approval(&mut self, answer: ApprovalAnswer) -> bool {
+        let Some(tx) = self.approval_tx.take() else {
+            return false;
+        };
+        self.approval = None;
+        self.revision += 1;
+        tx.send(answer).is_ok()
     }
 }
 
@@ -178,6 +298,45 @@ impl Output {
         }
     }
 
+    /// True when output is routed into a TUI transcript.
+    pub fn is_tui(&self) -> bool {
+        self.feed().is_some()
+    }
+
+    /// Clear the transcript pane (TUI only).
+    pub fn clear_transcript(&self) {
+        if let Some(feed) = self.feed() {
+            if let Ok(mut feed) = feed.lock() {
+                feed.clear();
+            }
+        }
+    }
+
+    /// Record the prompt the user typed so the transcript shows it.
+    pub fn user_prompt(&self, text: &str) {
+        if self.silent() {
+            return;
+        }
+        if self.feed().is_some() {
+            self.push(FeedEntry::User(text.to_string()));
+        }
+    }
+
+    /// Ask the user to approve a batch of tool calls.
+    ///
+    /// In TUI mode this publishes the request on the feed and awaits the
+    /// renderer's answer. Returns `None` when output is not routed to a TUI, so
+    /// the caller can fall back to stdin.
+    pub async fn ask_approval(&self, request: ApprovalRequest) -> Option<ApprovalAnswer> {
+        let feed = self.feed()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        match feed.lock() {
+            Ok(mut feed) => feed.request_approval(request, tx),
+            Err(_) => return Some(ApprovalAnswer::No),
+        }
+        Some(rx.await.unwrap_or(ApprovalAnswer::No))
+    }
+
     fn paint(&self, code: &str, text: &str) -> String {
         if self.color {
             format!("{code}{text}{RESET}")
@@ -211,8 +370,17 @@ impl Output {
         if self.silent() {
             return;
         }
-        if self.feed().is_some() {
-            // The TUI draws its own header from live agent state.
+        if let Some(feed) = self.feed() {
+            if let Ok(mut feed) = feed.lock() {
+                feed.set_header(HeaderInfo {
+                    version: version.to_string(),
+                    session: session.to_string(),
+                    model: model.to_string(),
+                    mode: mode.to_string(),
+                    base_url: base_url.to_string(),
+                    cwd: cwd.to_string(),
+                });
+            }
             return;
         }
         eprintln!(
@@ -251,7 +419,16 @@ impl Output {
 
     /// Separate the user's prompt from the assistant answer.
     pub fn turn_begin(&self, turn: usize) {
-        if self.silent() || !self.interactive {
+        if self.silent() {
+            return;
+        }
+        if let Some(feed) = self.feed() {
+            if let Ok(mut feed) = feed.lock() {
+                feed.set_busy(true);
+            }
+            return;
+        }
+        if !self.interactive {
             return;
         }
         println!();
@@ -471,6 +648,17 @@ impl Output {
         );
         if self.feed().is_some() {
             self.push(FeedEntry::TurnSummary(line));
+            if let Some(feed) = self.feed() {
+                if let Ok(mut feed) = feed.lock() {
+                    feed.add_turn(
+                        prompt,
+                        cached,
+                        usage.prefill_tokens(),
+                        usage.completion_tokens,
+                    );
+                    feed.set_busy(false);
+                }
+            }
             return;
         }
         eprintln!("{}", self.paint(DIM, &format!("── {line} ──")));

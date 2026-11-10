@@ -136,6 +136,7 @@ cached prefix.
 rustyclippy-code setup [--yes] [--force] [--path <file>]   interactive setup wizard (alias: init)
 rustyclippy-code doctor                                    check endpoint and effective config
 rustyclippy-code chat [--session <id>] [--continue] [--mode build|plan] interactive REPL
+rustyclippy-code tui [--session <id>] [--continue] [--mode build|plan]  full-screen TUI
 rustyclippy-code run <prompt> [--image <path>]... [--session <id>] [--continue] [--json] [--yes] [--max-steps N]
 rustyclippy-code stats [--project <path>] [--json]         lifetime token usage for a project
 rustyclippy-code sessions list|show <id>|delete <id>
@@ -143,6 +144,24 @@ rustyclippy-code cache report [--session <id>] [--json]
 rustyclippy-code config init [--path <file>] [--force]
 rustyclippy-code config show
 ```
+
+### TUI
+
+`tui` opens a full-screen interface styled after opencode: a header with the
+model, mode, session and endpoint; a scrolling transcript pane; a bordered
+prompt box; and a footer with live token totals and cache-hit ratio.
+
+```text
+↑ / ↓ / PgUp / PgDn   scroll the transcript (Esc jumps back to the newest line)
+Enter                 submit the prompt
+Ctrl+C                quit
+```
+
+Approvals appear in the prompt box instead of on stderr, so a batch of tool
+calls is answered without leaving the screen: `Y` allows, `n` denies, `a`
+allows for the rest of the session, and `s` chooses each call individually.
+`/cache`, `/stats` and `/help` render into the transcript rather than printing
+over the frame, and `/clear` empties the transcript pane.
 
 `stats` aggregates every session whose recorded cwd matches the project (the
 current directory by default): sessions, turns, prompt/cached/prefill/output/

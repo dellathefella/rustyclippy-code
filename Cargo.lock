@@ -1422,6 +1422,7 @@ dependencies = [
  "rustyclippy-llm",
  "rustyclippy-tools",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

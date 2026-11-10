@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -16,7 +16,7 @@ use crate::agent::{Agent, TurnResult};
 use crate::images;
 use crate::input::{self, InputOutcome};
 use crate::subagent_runner::CliSubagentRunner;
-use crate::ui::{fmt_bytes, fmt_num, Output};
+use crate::ui::{fmt_bytes, fmt_num, Output, UiFeed};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -161,6 +161,120 @@ pub async fn chat(
     Ok(())
 }
 
+/// Full-screen TUI: the agent runs in a background task while the renderer
+/// owns the terminal, so streaming text and approvals stay responsive.
+pub async fn tui(
+    config: Config,
+    session: Option<String>,
+    continue_session: bool,
+    mode: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let mut config = config;
+    if let Some(mode) = mode {
+        config.agent.mode = AgentMode::parse(&mode)?;
+    }
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let runner: Arc<dyn SubagentRunner> =
+        Arc::new(CliSubagentRunner::new(config.clone(), cwd.clone(), yes));
+
+    let feed = Arc::new(Mutex::new(UiFeed::default()));
+    let output = Output::tui(feed.clone());
+
+    let session = resolve_session(session, continue_session, &cwd)?;
+    let mut agent = match session {
+        Some(id) => Agent::resume(config.clone(), id, output.clone(), yes, Some(runner.clone()))?,
+        None => Agent::new_session(config.clone(), cwd.clone(), output.clone(), yes, Some(runner.clone()))?,
+    };
+
+    print_header(&agent);
+    agent.output.hint(
+        "Ctrl+C quits · /exit /session /cache /stats /new /mode build|plan /paste /image <path> /clear-images /help",
+    );
+
+    let mut tui = crate::tui::Tui::enter(feed.clone())?;
+    let result = run_tui_loop(&mut tui, &mut agent, &feed, &cwd, yes, &runner).await;
+    tui.leave()?;
+    result
+}
+
+async fn run_tui_loop(
+    tui: &mut crate::tui::Tui,
+    agent: &mut Agent,
+    feed: &Arc<Mutex<UiFeed>>,
+    cwd: &Path,
+    yes: bool,
+    runner: &Arc<dyn SubagentRunner>,
+) -> Result<()> {
+    let context = ChatContext { cwd, yes, runner };
+    let mut pending_images: Vec<ImageAttachment> = Vec::new();
+
+    loop {
+        tui.draw()?;
+        if !tui.poll(std::time::Duration::from_millis(50))? {
+            continue;
+        }
+        let Some(line) = tui.take_submitted() else {
+            if tui.quit() {
+                break;
+            }
+            continue;
+        };
+
+        if line.starts_with('/') {
+            match handle_command(agent, &line, &mut pending_images, &context)? {
+                CommandOutcome::Exit => break,
+                CommandOutcome::Continue => continue,
+            }
+        }
+
+        let (prompt, inline_images) = extract_image_paths(&line);
+        pending_images.extend(inline_images);
+        let images = std::mem::take(&mut pending_images);
+        agent.output.user_prompt(&prompt);
+
+        // Drive the turn while the renderer keeps painting frames, so streamed
+        // text and approval prompts stay responsive.
+        let turn = run_turn_task(tui, agent, prompt, images).await;
+        match turn {
+            Ok(result) => agent
+                .output
+                .turn_summary(agent.turn, &result.usage, result.steps),
+            Err(error) => agent.output.error(&format!("{error:#}")),
+        }
+        if let Ok(mut feed) = feed.lock() {
+            feed.set_busy(false);
+        }
+    }
+    Ok(())
+}
+
+/// Drive one turn while the renderer keeps painting frames.
+///
+/// The agent borrows `&mut self`, so it cannot be moved into a spawned task.
+/// Instead we poll the turn future and redraw between polls, which also lets
+/// the renderer answer approval requests while the agent is blocked.
+async fn run_turn_task(
+    tui: &mut crate::tui::Tui,
+    agent: &mut Agent,
+    prompt: String,
+    images: Vec<ImageAttachment>,
+) -> Result<TurnResult> {
+    let mut future = Box::pin(agent.run_turn_with_images(&prompt, images));
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(50));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = ticker.tick() => {
+                tui.draw()?;
+                // Drain keys so approvals can be answered mid-turn.
+                while tui.poll(std::time::Duration::from_millis(0))? {}
+            }
+        }
+    }
+}
+
 struct ChatContext<'a> {
     cwd: &'a Path,
     yes: bool,
@@ -232,6 +346,7 @@ fn handle_command(
                  /image <path>  attach an image file to the next prompt\n\
                  /images        list pending attachments\n\
                  /clear-images  drop pending attachments\n\
+                 /clear         clear the transcript pane (TUI)\n\
                  /help          this message",
             );
             Ok(CommandOutcome::Continue)
@@ -241,11 +356,17 @@ fn handle_command(
             Ok(CommandOutcome::Continue)
         }
         "/cache" => {
-            print_cache_report(&agent.store, &agent.session_id, false)?;
+            emit_lines(
+                &agent.output,
+                cache_report_lines(&agent.store, &agent.session_id, false)?,
+            );
             Ok(CommandOutcome::Continue)
         }
         "/stats" => {
-            print_project_stats(&agent.store, &agent.tool_ctx.cwd, false)?;
+            emit_lines(
+                &agent.output,
+                project_stats_lines(&agent.store, &agent.tool_ctx.cwd, false)?,
+            );
             Ok(CommandOutcome::Continue)
         }
         "/new" => {
@@ -326,6 +447,10 @@ fn handle_command(
             agent.output.hint("cleared pending images");
             Ok(CommandOutcome::Continue)
         }
+        "/clear" => {
+            agent.output.clear_transcript();
+            Ok(CommandOutcome::Continue)
+        }
         other => {
             agent
                 .output
@@ -335,6 +460,17 @@ fn handle_command(
     }
 }
 
+
+/// Print report lines to stdout, or route them into the TUI transcript.
+fn emit_lines(output: &Output, lines: Vec<String>) {
+    if output.is_tui() {
+        output.hint(&lines.join("\n"));
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+}
 /// Drag-and-drop / pasted image paths are attached instead of sent as text.
 fn extract_image_paths(input: &str) -> (String, Vec<ImageAttachment>) {
     let mut kept: Vec<String> = Vec::new();
@@ -454,6 +590,14 @@ impl ProjectTotals {
 }
 
 fn print_project_stats(store: &SessionStore, root: &Path, json: bool) -> Result<()> {
+    for line in project_stats_lines(store, root, json)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Project stats as plain lines so the REPL and the TUI can share it.
+fn project_stats_lines(store: &SessionStore, root: &Path, json: bool) -> Result<Vec<String>> {
     let sessions = store.list()?;
     let mut totals = ProjectTotals::default();
     let mut models: BTreeMap<String, ProjectTotals> = BTreeMap::new();
@@ -501,20 +645,21 @@ fn print_project_stats(store: &SessionStore, root: &Path, json: bool) -> Result<
                 "cache_hit_ratio": totals.hit_ratio(),
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
+        return Ok(vec![serde_json::to_string_pretty(&payload)?]);
     }
 
-    println!("project:  {}", root.display());
-    println!("sessions: {}", totals.sessions);
-    println!("turns:    {}", totals.turns);
+    let mut lines = vec![
+        format!("project:  {}", root.display()),
+        format!("sessions: {}", totals.sessions),
+        format!("turns:    {}", totals.turns),
+    ];
     if totals.sessions == 0 {
-        println!();
-        println!("no sessions recorded for this project yet");
-        return Ok(());
+        lines.push(String::new());
+        lines.push("no sessions recorded for this project yet".to_string());
+        return Ok(lines);
     }
-    println!();
-    println!(
+    lines.push(String::new());
+    lines.push(format!(
         "tokens:   prompt={} cached={} ({:.1}%) prefill={} output={} reasoning={}",
         fmt_num(totals.prompt_tokens),
         fmt_num(totals.cached_tokens),
@@ -522,15 +667,15 @@ fn print_project_stats(store: &SessionStore, root: &Path, json: bool) -> Result<
         fmt_num(totals.prefill_tokens),
         fmt_num(totals.completion_tokens),
         fmt_num(totals.reasoning_tokens)
-    );
-    println!();
-    println!("by model:");
-    println!(
+    ));
+    lines.push(String::new());
+    lines.push("by model:".to_string());
+    lines.push(format!(
         "  {:<56} {:>8} {:>6} {:>10} {:>10} {:>7} {:>10} {:>8}",
         "model", "sessions", "turns", "prompt", "cached", "hit%", "prefill", "out"
-    );
+    ));
     for (model, totals) in &models {
-        println!(
+        lines.push(format!(
             "  {:<56} {:>8} {:>6} {:>10} {:>10} {:>6.1}% {:>10} {:>8}",
             model,
             totals.sessions,
@@ -540,33 +685,40 @@ fn print_project_stats(store: &SessionStore, root: &Path, json: bool) -> Result<
             totals.hit_ratio() * 100.0,
             fmt_num(totals.prefill_tokens),
             fmt_num(totals.completion_tokens)
-        );
+        ));
+    }
+    Ok(lines)
+}
+
+fn print_cache_report(store: &SessionStore, session_id: &str, json: bool) -> Result<()> {
+    let lines = cache_report_lines(store, session_id, json)?;
+    for line in lines {
+        println!("{line}");
     }
     Ok(())
 }
 
-fn print_cache_report(store: &SessionStore, session_id: &str, json: bool) -> Result<()> {
+/// Cache report as plain lines so the REPL and the TUI can share it.
+fn cache_report_lines(store: &SessionStore, session_id: &str, json: bool) -> Result<Vec<String>> {
     let records = store.load_cache(session_id)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&records)?);
-        return Ok(());
+        return Ok(vec![serde_json::to_string_pretty(&records)?]);
     }
     if records.is_empty() {
-        println!("no cache records for session {session_id}");
-        return Ok(());
+        return Ok(vec![format!("no cache records for session {session_id}")]);
     }
 
-    println!(
+    let mut lines = vec![format!(
         "{:>5} {:>10} {:>10} {:>7} {:>10} {:>8} {:>8}",
         "turn", "prompt", "cached", "hit%", "prefill", "out", "stable"
-    );
+    )];
     for record in &records {
         let hit = if record.prompt_tokens == 0 {
             0.0
         } else {
             record.cached_tokens as f64 / record.prompt_tokens as f64 * 100.0
         };
-        println!(
+        lines.push(format!(
             "{:>5} {:>10} {:>10} {:>6.1}% {:>10} {:>8} {:>8}",
             record.turn,
             fmt_num(record.prompt_tokens),
@@ -575,10 +727,10 @@ fn print_cache_report(store: &SessionStore, session_id: &str, json: bool) -> Res
             fmt_num(record.prefill_tokens),
             fmt_num(record.completion_tokens),
             if record.stable { "yes" } else { "NO" }
-        );
+        ));
     }
-    print_aggregate(&records);
-    Ok(())
+    lines.extend(aggregate_lines(&records));
+    Ok(lines)
 }
 
 fn aggregate_report(store: &SessionStore, json: bool) -> Result<()> {
@@ -633,11 +785,13 @@ fn aggregate_report(store: &SessionStore, json: bool) -> Result<()> {
         );
     }
     let records: Vec<CacheTurnRecord> = all.into_iter().map(|(_, record)| record).collect();
-    print_aggregate(&records);
+    for line in aggregate_lines(&records) {
+        println!("{line}");
+    }
     Ok(())
 }
 
-fn print_aggregate(records: &[CacheTurnRecord]) {
+fn aggregate_lines(records: &[CacheTurnRecord]) -> Vec<String> {
     let prompt: usize = records.iter().map(|record| record.prompt_tokens).sum();
     let cached: usize = records.iter().map(|record| record.cached_tokens).sum();
     let prefill: usize = records.iter().map(|record| record.prefill_tokens).sum();
@@ -649,17 +803,19 @@ fn print_aggregate(records: &[CacheTurnRecord]) {
     } else {
         cached as f64 / prompt as f64 * 100.0
     };
-    println!();
-    println!(
-        "total: prompt={} cached={} ({:.1}%) prefill={} out={} reasoning={} unstable_turns={}",
-        fmt_num(prompt),
-        fmt_num(cached),
-        ratio,
-        fmt_num(prefill),
-        fmt_num(output),
-        fmt_num(reasoning),
-        unstable
-    );
+    vec![
+        String::new(),
+        format!(
+            "total: prompt={} cached={} ({:.1}%) prefill={} out={} reasoning={} unstable_turns={}",
+            fmt_num(prompt),
+            fmt_num(cached),
+            ratio,
+            fmt_num(prefill),
+            fmt_num(output),
+            fmt_num(reasoning),
+            unstable
+        ),
+    ]
 }
 
 pub fn config_init(path: &std::path::Path, force: bool) -> Result<()> {

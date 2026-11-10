@@ -5,6 +5,7 @@ mod commands;
 mod images;
 mod input;
 mod subagent_runner;
+mod tui;
 mod ui;
 mod wizard;
 
@@ -71,6 +72,18 @@ enum Command {
     },
     /// Interactive REPL
     Chat {
+        #[arg(long)]
+        session: Option<String>,
+        /// Resume the most recent session recorded for this directory
+        #[arg(long = "continue", conflicts_with = "session")]
+        continue_session: bool,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Full-screen TUI (opencode-style transcript, input box, live totals)
+    Tui {
         #[arg(long)]
         session: Option<String>,
         /// Resume the most recent session recorded for this directory
@@ -213,6 +226,12 @@ async fn run() -> Result<()> {
                     mode,
                     yes,
                 } => commands::chat(config, session, continue_session, mode, yes).await,
+                Command::Tui {
+                    session,
+                    continue_session,
+                    mode,
+                    yes,
+                } => commands::tui(config, session, continue_session, mode, yes).await,
                 Command::Stats { project, json } => commands::stats(project, json),
                 Command::Sessions { action } => match action {
                     SessionsAction::List => commands::sessions_list(),

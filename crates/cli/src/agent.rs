@@ -21,7 +21,7 @@ use rustyclippy_llm::{build_provider, LlmRequest, Provider, StreamEvent, Usage};
 use rustyclippy_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
 use serde_json::Value;
 
-use crate::ui::{fmt_num, truncate, Output};
+use crate::ui::{fmt_num, truncate, ApprovalAnswer, ApprovalRequest, Output};
 
 #[derive(Default)]
 struct PendingCall {
@@ -78,6 +78,7 @@ impl ToolCallAssembler {
     }
 }
 
+#[derive(Debug)]
 pub struct TurnResult {
     pub text: String,
     pub usage: Usage,
@@ -412,7 +413,6 @@ impl Agent {
     }
 
     /// Run one user turn with optional vision attachments.
-    #[allow(unused_assignments)]
     pub async fn run_turn_with_images(
         &mut self,
         input: &str,
@@ -425,23 +425,68 @@ impl Agent {
         self.store
             .append(&self.session_id, &SessionEvent::Message { message: user })?;
 
+        let outcome = self.run_steps().await;
+
+        // Close the turn in the session log no matter how it ended. Without a
+        // `TurnEnd` event the session summary reports zero turns and `--continue`
+        // resumes with a stale turn counter, so one failed turn would silently
+        // corrupt the accounting for every turn after it.
+        let (text, steps, usage, plan) = match outcome {
+            Ok(value) => value,
+            Err(error) => {
+                self.store.append(
+                    &self.session_id,
+                    &SessionEvent::TurnEnd {
+                        turn: self.turn,
+                        text: String::new(),
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        self.store.append(
+            &self.session_id,
+            &SessionEvent::TurnEnd {
+                turn: self.turn,
+                text: text.clone(),
+            },
+        )?;
+        Ok(TurnResult {
+            text,
+            usage,
+            steps,
+            plan,
+        })
+    }
+
+    /// The step loop: plan → guard → stream → tools → repeat.
+    ///
+    /// Returns the final text, step count, accumulated usage and last plan.
+    async fn run_steps(&mut self) -> Result<(String, usize, Usage, Option<RequestPlan>)> {
         let budget = self
             .config
             .cache
             .autocompact_budget(self.config.provider.max_context_tokens);
         let mut steps = 0usize;
-        let mut final_text = String::new();
+        let mut last_text = String::new();
         let mut turn_usage = Usage::default();
         let mut last_plan: Option<RequestPlan> = None;
 
         loop {
-            steps += 1;
-            if steps > self.config.agent.max_steps {
-                bail!(
-                    "agent exceeded {} steps without finishing",
+            // Check before counting so `steps` reports work actually performed.
+            if steps >= self.config.agent.max_steps {
+                // Hitting the step ceiling is a truncated turn, not a crash: the
+                // work already done stays in the transcript and the session log,
+                // and the user can ask the agent to continue. Bailing here would
+                // discard the partial answer and leave the turn unclosed.
+                self.output.warning(&format!(
+                    "stopped after {} steps without a final answer; the turn is incomplete \
+                     (raise agent.max_steps to allow longer runs)",
                     self.config.agent.max_steps
-                );
+                ));
+                break;
             }
+            steps += 1;
 
             let mut plan = self.engine.plan(
                 self.transcript.messages(),
@@ -574,15 +619,15 @@ impl Agent {
             self.output.metrics(self.turn, steps, &plan, &usage);
             last_plan = Some(plan);
 
+            last_text = text;
             if tool_calls.is_empty() {
-                final_text = text;
                 break;
             }
 
             // Permission checks are sequential (they may prompt on stdin);
             // execution is parallel. Results are appended in call order so the
             // transcript stays deterministic and the cached prefix is stable.
-            let approvals = self.check_permissions(&tool_calls);
+            let approvals = self.check_permissions(&tool_calls).await;
             for (call, approval) in tool_calls.iter().zip(&approvals) {
                 match approval {
                     Ok(()) => self.output.tool_call(&call.name, &call.arguments),
@@ -610,20 +655,7 @@ impl Agent {
             }
         }
 
-        self.store.append(
-            &self.session_id,
-            &SessionEvent::TurnEnd {
-                turn: self.turn,
-                text: final_text.clone(),
-            },
-        )?;
-
-        Ok(TurnResult {
-            text: final_text,
-            usage: turn_usage,
-            steps,
-            plan: last_plan,
-        })
+        Ok((last_text, steps, turn_usage, last_plan))
     }
 
     /// Refuse to send a request that would rewrite the cached prefix.
@@ -649,7 +681,7 @@ impl Agent {
         }
     }
 
-    fn check_permissions(&mut self, calls: &[ToolCall]) -> Vec<Result<(), String>> {
+    async fn check_permissions(&mut self, calls: &[ToolCall]) -> Vec<Result<(), String>> {
         let mut approvals: Vec<Option<Result<(), String>>> = Vec::with_capacity(calls.len());
         let mut pending: Vec<usize> = Vec::new();
 
@@ -669,7 +701,9 @@ impl Agent {
         }
 
         // One prompt for the whole batch instead of one per tool call.
-        let decision = self.ask_batch(&pending.iter().map(|&i| &calls[i]).collect::<Vec<_>>());
+        let decision = self
+            .ask_batch(&pending.iter().map(|&i| &calls[i]).collect::<Vec<_>>())
+            .await;
         for index in pending {
             let call = &calls[index];
             let outcome = match decision {
@@ -680,7 +714,7 @@ impl Agent {
                 }
                 BatchDecision::DenyAll => Err(format!("`{}` denied by the user", call.name)),
                 BatchDecision::PerCall => {
-                    if self.ask(&call.name, &call.arguments) {
+                    if self.ask(&call.name, &call.arguments).await {
                         Ok(())
                     } else {
                         Err(format!("`{}` denied by the user", call.name))
@@ -777,7 +811,22 @@ impl Agent {
         }
     }
 
-    fn ask_batch(&self, calls: &[&ToolCall]) -> BatchDecision {
+    async fn ask_batch(&self, calls: &[&ToolCall]) -> BatchDecision {
+        let request = ApprovalRequest {
+            calls: calls
+                .iter()
+                .map(|call| (call.name.clone(), describe(call)))
+                .collect(),
+        };
+        if let Some(answer) = self.output.ask_approval(request).await {
+            return match answer {
+                ApprovalAnswer::Yes => BatchDecision::AllowAll,
+                ApprovalAnswer::No => BatchDecision::DenyAll,
+                ApprovalAnswer::Session => BatchDecision::AllowSession,
+                ApprovalAnswer::Select => BatchDecision::PerCall,
+            };
+        }
+
         if calls.len() == 1 {
             let call = calls[0];
             let detail = describe(call);
@@ -803,8 +852,14 @@ impl Agent {
         }
     }
 
-    fn ask(&self, name: &str, args: &Value) -> bool {
+    async fn ask(&self, name: &str, args: &Value) -> bool {
         let detail = describe_args(name, args);
+        let request = ApprovalRequest {
+            calls: vec![(name.to_string(), detail.clone())],
+        };
+        if let Some(answer) = self.output.ask_approval(request).await {
+            return matches!(answer, ApprovalAnswer::Yes | ApprovalAnswer::Session);
+        }
         eprint!("allow {} {}? [Y/n/a] ", name, detail);
         matches!(read_answer(), Answer::Yes | Answer::Session)
     }
@@ -1016,5 +1071,131 @@ mod tests {
         );
         let calls = assembler.finish();
         assert!(calls[0].arguments.get("__parse_error").is_some());
+    }
+}
+
+#[cfg(test)]
+mod send_check {
+    use super::*;
+    #[test]
+    fn agent_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Agent>();
+    }
+}
+
+#[cfg(test)]
+mod step_limit {
+    use super::*;
+    use async_trait::async_trait;
+    use futures_util::stream::{self, BoxStream};
+    use rustyclippy_core::SessionEvent;
+    use rustyclippy_llm::{LlmRequest, Provider, StreamEvent};
+    use tempfile::TempDir;
+
+    /// Always answers with a tool call, so the agent never finishes on its own.
+    struct EndlessToolProvider;
+
+    #[async_trait]
+    impl Provider for EndlessToolProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+            let events = vec![
+                Ok(StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("todo".into()),
+                    args_fragment: Some(r#"{"items":[]}"#.into()),
+                }),
+                Ok(StreamEvent::Usage(Usage {
+                    prompt_tokens: 100,
+                    cached_tokens: 80,
+                    completion_tokens: 5,
+                    reasoning_tokens: 0,
+                })),
+                Ok(StreamEvent::Done),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    fn agent_with_limit(max_steps: usize) -> (Agent, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.agent.max_steps = max_steps;
+        config.permissions.bash = rustyclippy_core::PermissionMode::Auto;
+        config.permissions.edit = rustyclippy_core::PermissionMode::Auto;
+        config.permissions.write = rustyclippy_core::PermissionMode::Auto;
+        config.permissions.task = rustyclippy_core::PermissionMode::Auto;
+
+        let mut agent = Agent::new_session(
+            config,
+            dir.path().to_path_buf(),
+            Output::quiet(),
+            true,
+            None,
+        )
+        .unwrap();
+        agent.provider = Arc::new(EndlessToolProvider);
+        agent.store = SessionStore::new(dir.path().to_path_buf());
+        agent.store.create(SessionMeta {
+            id: agent.session_id.clone(),
+            cwd: dir.path().to_string_lossy().to_string(),
+            provider: "mock".into(),
+            model: "mock".into(),
+            mode: agent.mode.as_str().to_string(),
+            system_hash: agent.engine.system_hash().to_string(),
+            tools_hash: agent.engine.tools_hash().to_string(),
+            system_prompt: agent.system.clone(),
+            created_at: Utc::now(),
+        })
+        .unwrap();
+        (agent, dir)
+    }
+
+    #[tokio::test]
+    async fn hitting_the_step_limit_closes_the_turn() {
+        let (mut agent, _dir) = agent_with_limit(3);
+        let result = agent.run_turn_with_images("keep going", Vec::new()).await;
+
+        // The turn is truncated, not an error: the caller still gets a result.
+        let result = result.expect("step limit should truncate, not fail");
+        assert_eq!(result.steps, 3, "stops at the configured ceiling");
+
+        let events = agent.store.load(&agent.session_id).unwrap();
+        let turn_ends = events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::TurnEnd { .. }))
+            .count();
+        assert_eq!(turn_ends, 1, "the truncated turn is still closed in the log");
+
+        let summaries = agent.store.list().unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.id == agent.session_id)
+            .unwrap();
+        assert_eq!(summary.turns, 1, "the turn is counted");
+        assert!(summary.messages > 1, "partial work is preserved");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_still_closes_the_log() {
+        let (mut agent, _dir) = agent_with_limit(3);
+        // Force a failure inside the loop: an unknown tool trips the guard.
+        agent.registry = ToolRegistry::standard(AgentMode::Build);
+        let _result = agent.run_turn_with_images("x", Vec::new()).await;
+        // Whatever happens, the log must contain exactly one TurnEnd.
+        let events = agent.store.load(&agent.session_id).unwrap();
+        let turn_ends = events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::TurnEnd { .. }))
+            .count();
+        assert_eq!(turn_ends, 1, "even a failed turn is closed");
     }
 }

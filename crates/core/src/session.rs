@@ -351,6 +351,38 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_without_turn_end_is_not_counted() {
+        // A turn that bails mid-loop (e.g. the step limit) appends its user and
+        // assistant messages but never reaches `SessionEvent::TurnEnd`, so the
+        // summary reports zero turns even though the log holds real messages.
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let id = "failed";
+        store.create(meta(id)).unwrap();
+        store
+            .append(
+                id,
+                &SessionEvent::Message {
+                    message: Message::user("do the thing"),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                id,
+                &SessionEvent::Message {
+                    message: Message::assistant("partial"),
+                },
+            )
+            .unwrap();
+
+        let summaries = store.list().unwrap();
+        let summary = summaries.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(summary.messages, 2, "messages are recorded");
+        assert_eq!(summary.turns, 0, "the failed turn is invisible");
+    }
+
+    #[test]
     fn list_reports_sessions() {
         let dir = TempDir::new().unwrap();
         let store = SessionStore::new(dir.path().to_path_buf());
