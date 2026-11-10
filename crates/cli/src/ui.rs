@@ -199,10 +199,20 @@ pub struct UiFeed {
     thinking: bool,
     /// Estimated reasoning tokens streamed so far in the current turn.
     thinking_tokens: usize,
+    /// Characters of reasoning received so far in the current block.
+    thinking_chars: usize,
+    /// Characters of reasoning revealed to the transcript. Advanced one token
+    /// per frame so thinking appears progressively instead of all at once.
+    thinking_revealed: usize,
 }
 
 impl UiFeed {
     pub fn push(&mut self, entry: FeedEntry) {
+        // Track the reasoning block's length so the reveal cursor knows how
+        // much text is available to animate.
+        if let FeedEntry::Reasoning(chunk) = &entry {
+            self.thinking_chars += chunk.chars().count();
+        }
         self.entries.push(entry);
         self.revision += 1;
     }
@@ -289,10 +299,41 @@ impl UiFeed {
 
     /// Update the live thinking state: whether reasoning is streaming and how
     /// many tokens it has produced so far.
+    ///
+    /// Starting a new block resets the reveal cursor; ending one reveals the
+    /// whole block so nothing stays hidden after the stream stops.
     pub fn set_thinking(&mut self, thinking: bool, tokens: usize) {
+        if thinking && !self.thinking {
+            self.thinking_chars = 0;
+            self.thinking_revealed = 0;
+        }
+        if !thinking {
+            self.thinking_revealed = self.thinking_chars;
+        }
         self.thinking = thinking;
         self.thinking_tokens = tokens;
         self.revision += 1;
+    }
+
+    /// Characters of reasoning revealed so far.
+    pub fn thinking_revealed(&self) -> usize {
+        self.thinking_revealed
+    }
+
+    /// Advance the reveal cursor by roughly one token.
+    ///
+    /// Normally one token per frame keeps the animation readable. When the
+    /// stream runs far ahead, the step grows so the reveal catches up instead of
+    /// lagging behind the model indefinitely.
+    pub fn reveal_thinking(&mut self) -> bool {
+        if self.thinking_revealed >= self.thinking_chars {
+            return false;
+        }
+        let backlog = self.thinking_chars - self.thinking_revealed;
+        let step = if backlog > 400 { backlog / 8 } else { 4 };
+        self.thinking_revealed = (self.thinking_revealed + step).min(self.thinking_chars);
+        self.revision += 1;
+        true
     }
 
     pub fn thinking(&self) -> bool {
@@ -1126,6 +1167,62 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_advances_one_token_at_a_time() {
+        let mut feed = UiFeed::default();
+        feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("abcdefghijklmnop".into()));
+        assert_eq!(feed.thinking_revealed(), 0);
+
+        // Each frame reveals a small step, never the whole block at once.
+        assert!(feed.reveal_thinking());
+        let first = feed.thinking_revealed();
+        assert!(first > 0 && first < 16, "revealed {first} of 16 chars");
+
+        // Repeated frames walk forward until the block is fully shown.
+        while feed.reveal_thinking() {}
+        assert_eq!(feed.thinking_revealed(), 16);
+        assert!(!feed.reveal_thinking(), "reveal must stop at the end");
+    }
+
+    #[test]
+    fn reveal_catches_up_when_the_stream_runs_ahead() {
+        let mut feed = UiFeed::default();
+        feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("x".repeat(4_000)));
+        // A large backlog reveals faster than the steady one-token step.
+        feed.reveal_thinking();
+        assert!(
+            feed.thinking_revealed() > 4,
+            "backlog should reveal faster, got {}",
+            feed.thinking_revealed()
+        );
+    }
+
+    #[test]
+    fn ending_a_block_reveals_everything() {
+        let mut feed = UiFeed::default();
+        feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("abcdefgh".into()));
+        feed.reveal_thinking();
+        assert!(feed.thinking_revealed() < 8);
+
+        feed.set_thinking(false, 0);
+        assert_eq!(feed.thinking_revealed(), 8, "nothing may stay hidden");
+    }
+
+    #[test]
+    fn a_new_block_resets_the_reveal_cursor() {
+        let mut feed = UiFeed::default();
+        feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("first".into()));
+        feed.set_thinking(false, 0);
+        assert_eq!(feed.thinking_revealed(), 5);
+
+        feed.set_thinking(true, 0);
+        assert_eq!(feed.thinking_revealed(), 0, "new block starts hidden");
+    }
 
     #[test]
     fn numbers_get_thousands_separators() {
