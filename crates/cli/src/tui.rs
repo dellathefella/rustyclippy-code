@@ -15,7 +15,9 @@ use crossterm::event::{
     KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -386,7 +388,12 @@ impl Tui {
             .lock()
             .map(|feed| feed.entries().to_vec())
             .unwrap_or_default();
-        let lines = transcript_lines(&entries);
+        let thinking = self
+            .feed
+            .lock()
+            .map(|feed| feed.thinking())
+            .unwrap_or(false);
+        let lines = transcript_lines(&entries, thinking, self.spinner);
         // The transcript pane sits between a 5-row header, a 3-row prompt box
         // and a 1-row footer, and loses two columns/rows to its border.
         let width = size.width.saturating_sub(2) as usize;
@@ -517,15 +524,17 @@ fn render(frame: &mut ratatui::Frame, state: &FrameState<'_>) {
     let spinner = *spinner;
     let area = frame.area();
 
-    let (header, entries, approval, busy, totals) = match feed.lock() {
+    let (header, entries, approval, busy, totals, thinking, thinking_tokens) = match feed.lock() {
         Ok(feed) => (
             feed.header().cloned(),
             feed.entries().to_vec(),
             feed.pending_approval().cloned(),
             feed.busy(),
             feed.totals().clone(),
+            feed.thinking(),
+            feed.thinking_tokens(),
         ),
-        Err(_) => (None, Vec::new(), None, false, Default::default()),
+        Err(_) => (None, Vec::new(), None, false, Default::default(), false, 0),
     };
 
     // The input pane grows to fit an approval prompt (one line per call plus
@@ -557,8 +566,16 @@ fn render(frame: &mut ratatui::Frame, state: &FrameState<'_>) {
         ])
         .split(area);
 
-    render_header(frame, chunks[0], header.as_ref(), busy, spinner);
-    render_transcript(frame, chunks[1], &entries, scroll);
+    render_header(
+        frame,
+        chunks[0],
+        header.as_ref(),
+        busy,
+        spinner,
+        thinking,
+        thinking_tokens,
+    );
+    render_transcript(frame, chunks[1], &entries, scroll, thinking, spinner);
     render_queue(frame, chunks[2], queued);
     render_input(
         frame,
@@ -596,6 +613,8 @@ fn render_header(
     header: Option<&crate::ui::HeaderInfo>,
     busy: bool,
     spinner: usize,
+    thinking: bool,
+    thinking_tokens: usize,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -617,7 +636,14 @@ fn render_header(
 
     let status = if busy {
         let glyph = crate::ui::SPINNER[spinner % crate::ui::SPINNER.len()];
-        Span::styled(format!("{glyph} working"), Style::default().fg(WARN))
+        // While reasoning streams, show the live token count so the spinner
+        // reads as progress rather than an indeterminate blink.
+        let label = if thinking {
+            format!("{glyph} thinking · {thinking_tokens} tok")
+        } else {
+            format!("{glyph} working")
+        };
+        Span::styled(label, Style::default().fg(WARN))
     } else {
         Span::styled("● idle", Style::default().fg(MUTED))
     };
@@ -647,7 +673,14 @@ fn render_header(
     frame.render_widget(Paragraph::new(Text::from(vec![title, detail, cwd])), inner);
 }
 
-fn render_transcript(frame: &mut ratatui::Frame, area: Rect, entries: &[FeedEntry], scroll: usize) {
+fn render_transcript(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[FeedEntry],
+    scroll: usize,
+    thinking: bool,
+    spinner: usize,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -656,7 +689,7 @@ fn render_transcript(frame: &mut ratatui::Frame, area: Rect, entries: &[FeedEntr
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = transcript_lines(entries);
+    let lines = transcript_lines(entries, thinking, spinner);
 
     // A chat transcript grows downward, so pin the view to the newest lines and
     // let `scroll` walk backwards into history.
@@ -673,7 +706,9 @@ fn render_transcript(frame: &mut ratatui::Frame, area: Rect, entries: &[FeedEntr
 /// Number of terminal rows the lines occupy once wrapped to `width`.
 ///
 /// Mirrors ratatui's word wrapping closely enough for scroll math: greedy
-/// word packing, with over-long words split across rows.
+/// word packing, with over-long words split across rows. Widths are measured in
+/// terminal columns, not chars, so CJK text (two columns per glyph) wraps where
+/// the terminal actually wraps.
 fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
     if width == 0 {
         return 0;
@@ -688,7 +723,7 @@ fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
         let mut current = 0usize;
         let mut line_rows = 1usize;
         for word in text.split(' ') {
-            let word_width = word.chars().count();
+            let word_width = display_width(word);
             if word_width > width {
                 // Long word: split across as many rows as needed.
                 let extra = word_width.div_ceil(width);
@@ -710,10 +745,22 @@ fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
     rows
 }
 
+/// Terminal columns occupied by `text`.
+///
+/// CJK glyphs and other wide characters render as two columns, so counting
+/// chars would under-report the rows a line needs.
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
 /// Turn feed entries into styled transcript lines.
-fn transcript_lines(entries: &[FeedEntry]) -> Vec<Line<'static>> {
+fn transcript_lines(entries: &[FeedEntry], thinking: bool, spinner: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for entry in entries {
+    let mut index = 0usize;
+    while index < entries.len() {
+        let entry = &entries[index];
         match entry {
             FeedEntry::User(text) => {
                 lines.push(Line::from(vec![
@@ -732,33 +779,38 @@ fn transcript_lines(entries: &[FeedEntry]) -> Vec<Line<'static>> {
                 lines.push(Line::default());
             }
             FeedEntry::Text(chunk) => {
-                // Streamed chunks arrive piecemeal; append to the last rail line
-                // so a message reads as one block instead of one line per chunk.
-                for piece in chunk.split_inclusive('\n') {
-                    let body = piece.trim_end_matches('\n');
-                    if body.is_empty() {
-                        lines.push(Line::from(Span::styled("│", Style::default().fg(RAIL))));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(RAIL)),
-                            Span::raw(body.to_string()),
-                        ]));
-                    }
+                // Streamed chunks arrive piecemeal (often a single word), so
+                // coalesce the whole run into one buffer before splitting on
+                // newlines. Rendering per chunk would put every word on its own
+                // rail line and split words mid-token.
+                let mut buffer = chunk.clone();
+                while let Some(FeedEntry::Text(next)) = entries.get(index + 1) {
+                    buffer.push_str(next);
+                    index += 1;
                 }
+                push_rail_lines(&mut lines, &buffer, "│ ", RAIL, Style::default());
             }
             FeedEntry::Reasoning(chunk) => {
-                // Dimmed scratch work under a `⋯` rail, distinct from the answer.
-                for piece in chunk.split_inclusive('\n') {
-                    let body = piece.trim_end_matches('\n');
-                    if body.is_empty() {
-                        lines.push(Line::from(Span::styled("⋯", Style::default().fg(MUTED))));
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled("⋯ ", Style::default().fg(MUTED)),
-                            Span::styled(body.to_string(), Style::default().fg(MUTED)),
-                        ]));
-                    }
+                // Dimmed scratch work under a rail, distinct from the answer. The
+                // rail glyph animates while reasoning streams, so the block
+                // visibly "thinks" instead of freezing.
+                let glyph = if thinking {
+                    crate::ui::SPINNER[spinner % crate::ui::SPINNER.len()]
+                } else {
+                    "⋯"
+                };
+                let mut buffer = chunk.clone();
+                while let Some(FeedEntry::Reasoning(next)) = entries.get(index + 1) {
+                    buffer.push_str(next);
+                    index += 1;
                 }
+                push_rail_lines(
+                    &mut lines,
+                    &buffer,
+                    &format!("{glyph} "),
+                    MUTED,
+                    Style::default().fg(MUTED),
+                );
             }
             FeedEntry::ToolCall { name, detail } => {
                 lines.push(Line::from(vec![
@@ -823,8 +875,36 @@ fn transcript_lines(entries: &[FeedEntry]) -> Vec<Line<'static>> {
                 ]));
             }
         }
+        index += 1;
     }
     lines
+}
+
+/// Split a coalesced stream buffer into rail-prefixed transcript lines.
+///
+/// `prefix` is drawn in `rail_color`; `body_style` styles the text itself so
+/// reasoning can stay dimmed while answers render normally.
+fn push_rail_lines(
+    lines: &mut Vec<Line<'static>>,
+    buffer: &str,
+    prefix: &str,
+    rail_color: Color,
+    body_style: Style,
+) {
+    for piece in buffer.split_inclusive('\n') {
+        let body = piece.trim_end_matches('\n');
+        if body.is_empty() {
+            lines.push(Line::from(Span::styled(
+                prefix.trim_end().to_string(),
+                Style::default().fg(rail_color),
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), Style::default().fg(rail_color)),
+                Span::styled(body.to_string(), body_style),
+            ]));
+        }
+    }
 }
 
 fn render_input(
@@ -854,7 +934,10 @@ fn render_input(
     frame.render_widget(block, area);
 
     let line = Line::from(vec![
-        Span::styled("› ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "› ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(input.to_string()),
     ]);
     frame.render_widget(Paragraph::new(line), inner);
@@ -928,6 +1011,15 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Tot
             Style::default().fg(Color::White),
         ),
     ];
+    // Reasoning tokens are billed separately by the server, so surface them
+    // only when the model actually thought.
+    if totals.reasoning > 0 {
+        stats.push(Span::styled("  think ", Style::default().fg(MUTED)));
+        stats.push(Span::styled(
+            crate::ui::fmt_num(totals.reasoning),
+            Style::default().fg(WARN),
+        ));
+    }
     if let Some(rate) = totals.decode_tokens_per_second {
         stats.push(Span::styled("  ", Style::default().fg(MUTED)));
         stats.push(Span::styled(
@@ -987,7 +1079,7 @@ mod tests {
             FeedEntry::User("hello".into()),
             FeedEntry::Text("world\n".into()),
         ];
-        let lines = transcript_lines(&entries);
+        let lines = transcript_lines(&entries, false, 0);
         assert!(lines.iter().any(|line| line.to_string().contains("you")));
         assert!(lines.iter().any(|line| line.to_string().contains("world")));
     }
@@ -999,7 +1091,7 @@ mod tests {
             ok: false,
             detail: "boom".into(),
         }];
-        let lines = transcript_lines(&entries);
+        let lines = transcript_lines(&entries, false, 0);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].to_string().contains("boom"));
     }
@@ -1088,12 +1180,79 @@ mod tests {
     }
 
     #[test]
+    fn streamed_chunks_render_as_one_wrapped_block() {
+        // End-to-end: the transcript pane must show a paragraph, not one word
+        // per row (the post-compaction bug).
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        {
+            let mut feed = feed.lock().unwrap();
+            feed.push(FeedEntry::User("hi".into()));
+            for chunk in [
+                "the reasoning ",
+                "rail glyph ",
+                "animates ",
+                "through ",
+                "SPINNER",
+            ] {
+                feed.push(FeedEntry::Text(chunk.into()));
+            }
+        }
+        let screen = render_to_rows(&feed, "", 0).join("\n");
+        assert!(
+            screen.contains("the reasoning rail glyph animates through SPINNER"),
+            "chunks were split across rows:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn streamed_chunks_coalesce_into_one_block() {
+        // The server streams word-sized chunks; each must join the previous
+        // rail line instead of starting a new one.
+        let entries = vec![
+            FeedEntry::Text("the reasoning ".into()),
+            FeedEntry::Text("rail glyph ".into()),
+            FeedEntry::Text("animates".into()),
+        ];
+        let lines = transcript_lines(&entries, false, 0);
+        assert_eq!(lines.len(), 1, "chunks must coalesce: {lines:?}");
+        assert_eq!(lines[0].to_string(), "│ the reasoning rail glyph animates");
+    }
+
+    #[test]
+    fn streamed_chunks_keep_newlines() {
+        let entries = vec![
+            FeedEntry::Text("first line\n".into()),
+            FeedEntry::Text("second ".into()),
+            FeedEntry::Text("line\n".into()),
+        ];
+        let lines = transcript_lines(&entries, false, 0);
+        assert_eq!(lines.len(), 2, "newlines must still split: {lines:?}");
+        assert_eq!(lines[0].to_string(), "│ first line");
+        assert_eq!(lines[1].to_string(), "│ second line");
+    }
+
+    #[test]
+    fn reasoning_chunks_coalesce_into_one_block() {
+        let entries = vec![
+            FeedEntry::Reasoning("weighing ".into()),
+            FeedEntry::Reasoning("options".into()),
+        ];
+        let lines = transcript_lines(&entries, false, 0);
+        assert_eq!(lines.len(), 1, "reasoning chunks must coalesce: {lines:?}");
+        assert_eq!(lines[0].to_string(), "⋯ weighing options");
+    }
+
+    #[test]
     fn transcript_renders_reasoning_dimmed() {
         let entries = vec![FeedEntry::Reasoning("weighing options\n".into())];
-        let lines = transcript_lines(&entries);
+        let lines = transcript_lines(&entries, false, 0);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].to_string().contains("weighing options"));
         assert!(lines[0].to_string().starts_with("⋯"));
+
+        // While reasoning streams, the rail animates instead of freezing.
+        let animated = transcript_lines(&entries, true, 3);
+        assert!(animated[0].to_string().starts_with(crate::ui::SPINNER[3]));
     }
 
     #[test]
@@ -1167,7 +1326,11 @@ mod tests {
                     .join("\n"),
             );
         }
-        assert!(frames[0].contains("working"), "busy status missing:\n{}", frames[0]);
+        assert!(
+            frames[0].contains("working"),
+            "busy status missing:\n{}",
+            frames[0]
+        );
         assert_ne!(frames[0], frames[1], "spinner frame did not advance");
         assert_ne!(frames[1], frames[2], "spinner frame did not advance");
     }
@@ -1234,16 +1397,25 @@ mod tests {
                 ok: true,
                 detail: "src".into(),
             });
-            feed.add_turn(1200, 900, 300, 40);
+            feed.add_turn(1200, 900, 300, 40, 25);
         }
         let rows = render_to_rows(&feed, "next question", 13);
         let screen = rows.join("\n");
 
-        assert!(screen.contains("rustyclippy-code"), "header missing:\n{screen}");
+        assert!(
+            screen.contains("rustyclippy-code"),
+            "header missing:\n{screen}"
+        );
         assert!(screen.contains("deepseek-v4"), "model missing:\n{screen}");
         assert!(screen.contains("build"), "mode missing:\n{screen}");
-        assert!(screen.contains("explain the cache"), "user prompt missing:\n{screen}");
-        assert!(screen.contains("prefix stays stable"), "assistant text missing:\n{screen}");
+        assert!(
+            screen.contains("explain the cache"),
+            "user prompt missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("prefix stays stable"),
+            "assistant text missing:\n{screen}"
+        );
         assert!(screen.contains("ls -la"), "tool call missing:\n{screen}");
         assert!(screen.contains("next question"), "input missing:\n{screen}");
         assert!(screen.contains("1,200"), "totals missing:\n{screen}");
@@ -1265,8 +1437,14 @@ mod tests {
         }
         let rows = render_to_rows(&feed, "", 0);
         let screen = rows.join("\n");
-        assert!(screen.contains("approval needed"), "approval box missing:\n{screen}");
-        assert!(screen.contains("src/main.rs"), "call detail missing:\n{screen}");
+        assert!(
+            screen.contains("approval needed"),
+            "approval box missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("src/main.rs"),
+            "call detail missing:\n{screen}"
+        );
         assert!(screen.contains("[Y] allow"), "key hints missing:\n{screen}");
     }
 
@@ -1287,8 +1465,14 @@ mod tests {
             );
         }
         let screen = render_to_rows(&feed, "", 0).join("\n");
-        assert!(screen.contains("2 tools need approval"), "batch header missing:\n{screen}");
-        assert!(screen.contains("[s] choose each"), "batch hints missing:\n{screen}");
+        assert!(
+            screen.contains("2 tools need approval"),
+            "batch header missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("[s] choose each"),
+            "batch hints missing:\n{screen}"
+        );
     }
 
     #[test]
@@ -1326,6 +1510,24 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_height_counts_cjk_as_two_columns() {
+        // 12 CJK glyphs occupy 24 columns, so at width 20 they need 2 rows.
+        let lines = vec![Line::from("你好世界你好世界你好世界")];
+        assert_eq!(display_width("你好世界你好世界你好世界"), 24);
+        assert_eq!(wrapped_height(&lines, 20), 2);
+        // Counting chars would have reported a single row.
+        assert_ne!(wrapped_height(&lines, 20), 1);
+    }
+
+    #[test]
+    fn display_width_mixes_narrow_and_wide() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("日本"), 4);
+        assert_eq!(display_width("a日b"), 4);
+        assert_eq!(display_width(""), 0);
+    }
+
+    #[test]
     fn newest_lines_stay_visible_when_transcript_overflows() {
         let feed = Arc::new(Mutex::new(UiFeed::default()));
         {
@@ -1341,7 +1543,10 @@ mod tests {
         // The transcript pane is ~14 rows tall, so early rows scroll off and the
         // last row must still be on screen.
         assert!(screen.contains("row 39"), "newest row missing:\n{screen}");
-        assert!(!screen.contains("row 0\n"), "oldest row should be scrolled off:\n{screen}");
+        assert!(
+            !screen.contains("row 0\n"),
+            "oldest row should be scrolled off:\n{screen}"
+        );
     }
 
     #[test]
@@ -1462,7 +1667,10 @@ mod tests {
         let feed = Arc::new(Mutex::new(UiFeed::default()));
         let screen = render_to_rows(&feed, "", 0).join("\n");
         assert!(!screen.contains("ctx"), "gauge should be hidden:\n{screen}");
-        assert!(!screen.contains("tok/s"), "speed should be hidden:\n{screen}");
+        assert!(
+            !screen.contains("tok/s"),
+            "speed should be hidden:\n{screen}"
+        );
     }
 
     #[test]

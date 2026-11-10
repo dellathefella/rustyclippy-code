@@ -144,22 +144,208 @@ fn describe(call: &ToolCall) -> String {
 }
 
 /// Commands that only inspect the workspace. Anything else prompts.
+///
+/// `git` is deliberately absent: it is handled by [`git_is_read_only`], because
+/// a blanket allow would let `git branch -D` and `git config --global` run
+/// without approval.
 const READ_ONLY_COMMANDS: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "fd", "tree", "file", "stat", "du",
     "pwd", "echo", "which", "type", "env", "printenv", "date", "uname", "whoami", "basename",
     "dirname", "realpath", "readlink", "diff", "sort", "uniq", "cut", "tr", "sed", "awk", "jq",
-    "git", "true", "false", "test",
+    "true", "false", "test",
 ];
 
 /// Subcommands that mutate even though the binary is read-only.
 const MUTATING_SUBCOMMANDS: &[&str] = &[
-    "commit", "push", "pull", "merge", "rebase", "reset", "checkout", "switch", "clean", "rm",
-    "mv", "add", "stash", "tag", "init", "clone", "install", "publish", "run", "build", "test",
-    "fix", "fmt", "update", "remove", "delete", "apply", "restore", "cherry-pick", "revert",
+    "commit",
+    "push",
+    "pull",
+    "merge",
+    "rebase",
+    "reset",
+    "checkout",
+    "switch",
+    "clean",
+    "rm",
+    "mv",
+    "add",
+    "stash",
+    "tag",
+    "init",
+    "clone",
+    "install",
+    "publish",
+    "run",
+    "build",
+    "test",
+    "fix",
+    "fmt",
+    "update",
+    "remove",
+    "delete",
+    "apply",
+    "restore",
+    "cherry-pick",
+    "revert",
 ];
 
+/// Git subcommands that never write to the repository.
+const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "describe",
+    "rev-parse",
+    "ls-files",
+    "ls-tree",
+    "cat-file",
+    "shortlog",
+    "whatchanged",
+    "grep",
+    "count-objects",
+    "for-each-ref",
+    "show-ref",
+    "merge-base",
+    "name-rev",
+    "rev-list",
+    "help",
+    "version",
+    "check-ignore",
+    "check-attr",
+    "var",
+];
+
+/// Git subcommands that read only when their own arguments say so.
+const CONDITIONAL_GIT_SUBCOMMANDS: &[&str] = &[
+    "branch",
+    "tag",
+    "remote",
+    "stash",
+    "config",
+    "worktree",
+    "notes",
+    "submodule",
+];
+
+/// Git flags that write, even under an otherwise read-only subcommand.
+const MUTATING_GIT_FLAGS: &[&str] = &[
+    "-d",
+    "-D",
+    "-m",
+    "-M",
+    "-f",
+    "--force",
+    "--delete",
+    "--move",
+    "--rename",
+    "--set",
+    "--unset",
+    "--unset-all",
+    "--add",
+    "--replace-all",
+    "--edit",
+    "-e",
+    "--prune",
+    "--update",
+    "-u",
+    "--hard",
+    "--soft",
+    "--mixed",
+    "--keep",
+    "--orphan",
+    "--detach",
+    "--amend",
+    "--squash",
+];
+
+/// Git `config` flags that read instead of write.
+const READ_ONLY_GIT_CONFIG_FLAGS: &[&str] = &["--get", "--get-all", "--get-regexp", "--list", "-l"];
+
+/// Git subcommands whose read-only form is a specific sub-subcommand.
+const READ_ONLY_GIT_SUBSUBCOMMANDS: &[(&str, &[&str])] = &[
+    ("stash", &["list", "show"]),
+    ("worktree", &["list"]),
+    ("notes", &["list", "show"]),
+    ("submodule", &["status", "summary"]),
+    ("remote", &["show", "get-url"]),
+];
+
+/// True when a `git` invocation only inspects the repository.
+fn git_is_read_only(words: &[&str]) -> bool {
+    // Skip global flags such as `--no-pager`, `-C <dir>` or `--git-dir=<path>`.
+    let mut index = 0;
+    while index < words.len() && words[index].starts_with('-') {
+        index += 1;
+    }
+    let Some(subcommand) = words.get(index) else {
+        return false;
+    };
+    let rest = &words[index + 1..];
+
+    if READ_ONLY_GIT_SUBCOMMANDS.contains(subcommand) {
+        return true;
+    }
+    if !CONDITIONAL_GIT_SUBCOMMANDS.contains(subcommand) {
+        return false;
+    }
+
+    // `git config` writes unless an explicit read flag is present.
+    if *subcommand == "config" {
+        return rest
+            .iter()
+            .any(|word| READ_ONLY_GIT_CONFIG_FLAGS.contains(word));
+    }
+
+    // Some subcommands read only through a named sub-subcommand.
+    if let Some((_, allowed)) = READ_ONLY_GIT_SUBSUBCOMMANDS
+        .iter()
+        .find(|(name, _)| name == subcommand)
+    {
+        let Some(first) = rest.first() else {
+            return false;
+        };
+        return allowed.contains(first);
+    }
+
+    // `branch`, `tag`: read only when no mutating flag is present.
+    !rest.iter().any(|word| MUTATING_GIT_FLAGS.contains(word))
+}
+
+/// Flags that write for a specific binary. `grep -o` is read-only, so the
+/// check has to be per-binary rather than a blanket flag list.
+fn binary_flags_mutate(binary: &str, words: &[&str]) -> bool {
+    match binary {
+        "sed" => words.iter().any(|word| {
+            word.starts_with("--in-place") || (word.starts_with("-i") && !word.starts_with("--"))
+        }),
+        "sort" => words
+            .iter()
+            .any(|word| *word == "-o" || word.starts_with("--output")),
+        "awk" => words.iter().any(|word| {
+            word.starts_with("--in-place") || (word.starts_with("-i") && !word.starts_with("--"))
+        }),
+        "find" => words.iter().any(|word| {
+            matches!(
+                *word,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fwrite"
+                    | "-fls"
+            )
+        }),
+        _ => false,
+    }
+}
+
 /// True when a shell command only reads. Conservative: any redirection, any
-/// unknown binary, or any mutating subcommand counts as a mutation.
+/// unknown binary, any mutating subcommand, or any mutating flag counts as a
+/// mutation.
 fn is_read_only_command(command: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -179,17 +365,28 @@ fn is_read_only_command(command: &str) -> bool {
         if segment.is_empty() {
             continue;
         }
-        let mut words = segment.split_whitespace();
-        let Some(binary) = words.next() else {
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        let Some(binary) = words.first() else {
             continue;
         };
         // Strip a leading path so `/bin/ls` is recognized.
         let binary = binary.rsplit('/').next().unwrap_or(binary);
+
+        if binary == "git" {
+            if !git_is_read_only(&words[1..]) {
+                return false;
+            }
+            continue;
+        }
         if !READ_ONLY_COMMANDS.contains(&binary) {
             return false;
         }
-        // `sed -i`, `find -delete`, `git commit`, `cargo build` all write.
-        for word in words {
+        // `sed -i`, `sort -o`, `find -delete` write despite a read-only binary.
+        if binary_flags_mutate(binary, &words[1..]) {
+            return false;
+        }
+        // `cargo build`, `git commit` and friends write via their subcommand.
+        for word in &words[1..] {
             let word = word.trim_start_matches('-');
             if MUTATING_SUBCOMMANDS.contains(&word) {
                 return false;
@@ -773,7 +970,11 @@ impl Agent {
         // Read-only shell inspection (`ls`, `cat`, `grep`, `git status`) never
         // needs approval; prompting for each one makes a turn unusable.
         if matches!(call.name.as_str(), "bash" | "loop") {
-            if let Some(command) = call.arguments.get("command").and_then(|value| value.as_str()) {
+            if let Some(command) = call
+                .arguments
+                .get("command")
+                .and_then(|value| value.as_str())
+            {
                 if is_read_only_command(command) {
                     return Ok(true);
                 }
@@ -866,7 +1067,10 @@ impl Agent {
         for (index, call) in calls.iter().enumerate() {
             eprintln!("  {}. {} {}", index + 1, call.name, describe(call));
         }
-        eprint!("allow all {}? [Y/n/a/s] (a = allow for this session, s = choose each) ", calls.len());
+        eprint!(
+            "allow all {}? [Y/n/a/s] (a = allow for this session, s = choose each) ",
+            calls.len()
+        );
         match read_answer() {
             Answer::Yes => BatchDecision::AllowAll,
             Answer::No => BatchDecision::DenyAll,
@@ -1004,8 +1208,69 @@ mod tests {
             "find . -name '*.rs'",
             "head -20 README.md | wc -l",
             "/bin/ls",
+            // `grep -o` is read-only; the flag check must be per-binary.
+            "grep -o foo file.rs",
+            "sort file.txt",
+            "sed 's/a/b/' file.rs",
+            "git branch",
+            "git branch --list",
+            "git tag",
+            "git remote show origin",
+            "git stash list",
+            "git worktree list",
+            "git config --get user.name",
+            "git config --list",
+            "git rev-parse HEAD",
+            "git --no-pager log -1",
         ] {
-            assert!(is_read_only_command(command), "{command} should be read-only");
+            assert!(
+                is_read_only_command(command),
+                "{command} should be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_git_commands_prompt() {
+        // These previously slipped through because `git` was blanket-allowed.
+        for command in [
+            "git branch -D feature",
+            "git branch -d feature",
+            "git branch -m old new",
+            "git tag -d v1",
+            "git tag -f v1",
+            "git config --global user.name x",
+            "git config user.email x",
+            "git config --unset user.name",
+            "git remote add origin url",
+            "git remote remove origin",
+            "git stash",
+            "git stash drop",
+            "git worktree add ../wt",
+            "git gc",
+            "git fetch origin",
+            "git checkout main",
+            "git reset --hard",
+            "git clean -fd",
+            "git submodule update",
+            "git notes add -m x",
+        ] {
+            assert!(!is_read_only_command(command), "{command} should prompt");
+        }
+    }
+
+    #[test]
+    fn mutating_flags_prompt_even_for_read_only_binaries() {
+        for command in [
+            "sed --in-place 's/a/b/' f.rs",
+            "sed -i.bak 's/a/b/' f.rs",
+            "sort -o out.txt in.txt",
+            "sort --output=out.txt in.txt",
+            "awk -i inplace '{print}' f",
+            "find . -exec rm {} \\;",
+            "find . -fprint out.txt",
+        ] {
+            assert!(!is_read_only_command(command), "{command} should prompt");
         }
     }
 
@@ -1168,18 +1433,20 @@ mod step_limit {
         .unwrap();
         agent.provider = Arc::new(EndlessToolProvider);
         agent.store = SessionStore::new(dir.path().to_path_buf());
-        agent.store.create(SessionMeta {
-            id: agent.session_id.clone(),
-            cwd: dir.path().to_string_lossy().to_string(),
-            provider: "mock".into(),
-            model: "mock".into(),
-            mode: agent.mode.as_str().to_string(),
-            system_hash: agent.engine.system_hash().to_string(),
-            tools_hash: agent.engine.tools_hash().to_string(),
-            system_prompt: agent.system.clone(),
-            created_at: Utc::now(),
-        })
-        .unwrap();
+        agent
+            .store
+            .create(SessionMeta {
+                id: agent.session_id.clone(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                mode: agent.mode.as_str().to_string(),
+                system_hash: agent.engine.system_hash().to_string(),
+                tools_hash: agent.engine.tools_hash().to_string(),
+                system_prompt: agent.system.clone(),
+                created_at: Utc::now(),
+            })
+            .unwrap();
         (agent, dir)
     }
 
@@ -1197,7 +1464,10 @@ mod step_limit {
             .iter()
             .filter(|event| matches!(event, SessionEvent::TurnEnd { .. }))
             .count();
-        assert_eq!(turn_ends, 1, "the truncated turn is still closed in the log");
+        assert_eq!(
+            turn_ends, 1,
+            "the truncated turn is still closed in the log"
+        );
 
         let summaries = agent.store.list().unwrap();
         let summary = summaries

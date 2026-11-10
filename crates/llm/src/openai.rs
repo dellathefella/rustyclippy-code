@@ -252,18 +252,13 @@ impl Provider for OpenAiProvider {
 
         let mut bytes = response.bytes_stream();
         let stream = async_stream::try_stream! {
-            let mut buffer = String::new();
+            let mut buffer = SseBuffer::default();
             let mut finished = false;
 
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.context("reading SSE chunk")?;
-                let text = String::from_utf8_lossy(&chunk).replace("\r\n", "\n");
-                buffer.push_str(&text);
 
-                while let Some(position) = buffer.find("\n\n") {
-                    let event = buffer[..position].to_string();
-                    buffer.drain(..position + 2);
-
+                for event in buffer.push(&chunk) {
                     for line in event.lines() {
                         let line = line.trim();
                         let Some(data) = line.strip_prefix("data:") else { continue };
@@ -347,6 +342,35 @@ impl Provider for OpenAiProvider {
     }
 }
 
+/// Incremental SSE framing over raw bytes.
+///
+/// Chunks arrive at arbitrary byte boundaries, so a multi-byte UTF-8 character
+/// can straddle two chunks. Decoding each chunk independently would corrupt it;
+/// this buffer accumulates bytes and decodes only complete events.
+#[derive(Default)]
+struct SseBuffer {
+    pending: Vec<u8>,
+}
+
+impl SseBuffer {
+    /// Append a network chunk and return every complete event it completes.
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(chunk);
+        // Raw `\r` bytes only ever appear as SSE line terminators; JSON escapes
+        // them as `\\r`, so stripping is safe and lets one `\n\n` separator
+        // match both CRLF and LF framing.
+        self.pending.retain(|byte| *byte != b'\r');
+
+        let mut events = Vec::new();
+        while let Some(position) = self.pending.windows(2).position(|pair| pair == b"\n\n") {
+            let event = String::from_utf8_lossy(&self.pending[..position]).into_owned();
+            self.pending.drain(..position + 2);
+            events.push(event);
+        }
+        events
+    }
+}
+
 fn to_openai_message(message: &Message) -> Value {
     match message.role {
         Role::Assistant => {
@@ -394,6 +418,55 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_buffer_decodes_utf8_split_across_chunks() {
+        // A multi-byte character straddling a chunk boundary must survive.
+        let event = "data: {\"choices\":[{\"delta\":{\"content\":\"héllo 世界\"}}]}\n\n";
+        let bytes = event.as_bytes();
+        // Split inside the 2-byte `é`.
+        let split = bytes.iter().position(|b| *b == 0xC3).unwrap() + 1;
+        let mut buffer = SseBuffer::default();
+        assert!(buffer.push(&bytes[..split]).is_empty());
+        let events = buffer.push(&bytes[split..]);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("héllo 世界"), "got {:?}", events[0]);
+        assert!(
+            !events[0].contains('\u{FFFD}'),
+            "replacement char leaked in"
+        );
+    }
+
+    #[test]
+    fn sse_buffer_handles_crlf_and_multiple_events() {
+        let mut buffer = SseBuffer::default();
+        let events = buffer.push(b"data: one\r\n\r\ndata: two\r\n\r\n");
+        assert_eq!(
+            events,
+            vec!["data: one".to_string(), "data: two".to_string()]
+        );
+    }
+
+    #[test]
+    fn sse_buffer_keeps_partial_event_pending() {
+        let mut buffer = SseBuffer::default();
+        assert!(buffer.push(b"data: partial").is_empty());
+        let events = buffer.push(b"\n\n");
+        assert_eq!(events, vec!["data: partial".to_string()]);
+    }
+
+    #[test]
+    fn sse_buffer_preserves_escaped_carriage_return() {
+        // JSON escapes `\r` as a backslash-r pair, which must not be stripped.
+        let mut buffer = SseBuffer::default();
+        let events = buffer.push(b"data: {\"a\":\"x\\ry\"}\n\n");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].contains("\\r"),
+            "escaped \\r was stripped: {:?}",
+            events[0]
+        );
+    }
     use rustyclippy_core::ToolCall;
 
     fn provider() -> OpenAiProvider {

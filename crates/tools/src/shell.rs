@@ -189,13 +189,21 @@ pub async fn run_shell(
     timeout: Duration,
     max_chars: usize,
 ) -> Result<(bool, String)> {
-    let mut child = Command::new("sh")
+    let mut command_builder = Command::new("sh");
+    command_builder
         .arg("-c")
         .arg(command)
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put the shell in its own process group so a timeout can kill the whole
+    // tree. Killing only `sh` leaves grandchildren (a `cargo build`, a dev
+    // server) running forever.
+    #[cfg(unix)]
+    command_builder.process_group(0);
+
+    let mut child = command_builder
         .spawn()
         .with_context(|| format!("spawning command in {}", workdir.display()))?;
 
@@ -207,7 +215,7 @@ pub async fn run_shell(
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result.context("waiting for command")?,
         Err(_) => {
-            let _ = child.kill().await;
+            kill_tree(&mut child).await;
             let _ = child.wait().await;
             let stdout = stdout_task.await.unwrap_or_default();
             let stderr = stderr_task.await.unwrap_or_default();
@@ -240,6 +248,24 @@ pub async fn run_shell(
         "exit_code: {code}\n--- stdout ---\n{stdout_display}\n--- stderr ---\n{stderr_display}"
     );
     Ok((status.success(), content))
+}
+
+/// Kill a spawned shell and every process in its group.
+///
+/// `child.kill()` signals only the shell; a command like `cargo build` keeps
+/// running as an orphan. On Unix the shell was spawned with `process_group(0)`,
+/// so its pid is also the group id and `killpg` reaches the whole tree.
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SIGKILL the group; ignore ESRCH when the tree already exited.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill().await;
 }
 
 async fn read_all<R: AsyncRead + Unpin>(mut reader: R) -> String {
@@ -290,6 +316,40 @@ mod tests {
             .unwrap();
         assert!(!result.ok);
         assert!(result.content.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_tree() {
+        // The shell backgrounds a grandchild and waits. Killing only `sh`
+        // would leave the grandchild running; the group kill must reach it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("child.pid");
+        let command = format!("sleep 30 & echo $! > {}; wait", pid_file.display());
+
+        let started = std::time::Instant::now();
+        let result = BashTool
+            .execute(&json!({"command": command, "timeout_ms": 200}), &context())
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(!result.ok);
+        assert!(result.content.contains("timed out"));
+
+        // Draining the pipes blocks until every writer exits. If the grandchild
+        // survived, this call would hang for the full `sleep 30`.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout took {elapsed:?}; the grandchild kept the pipes open"
+        );
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "grandchild {pid} survived the timeout");
     }
 
     #[tokio::test]

@@ -410,7 +410,9 @@ mod tests {
         let older = Utc::now() - chrono::Duration::hours(2);
         store.create(meta_in("old", &cwd, older)).unwrap();
         store.create(meta_in("new", &cwd, Utc::now())).unwrap();
-        store.create(meta_in("other", "/somewhere/else", Utc::now())).unwrap();
+        store
+            .create(meta_in("other", "/somewhere/else", Utc::now()))
+            .unwrap();
 
         let latest = store.latest_for_cwd(project.path()).unwrap().unwrap();
         assert_eq!(latest.id, "new");

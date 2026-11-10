@@ -129,13 +129,22 @@ impl TaskManager {
     pub async fn list(&self) -> Vec<Arc<Mutex<BackgroundTask>>> {
         let mut tasks: Vec<_> = self.tasks.lock().await.values().cloned().collect();
         tasks.sort_by(|a, b| {
-            // Sort by numeric id suffix so task-2 comes after task-1.
+            // Sort by the numeric id suffix so task-2 comes before task-10;
+            // comparing the ids as strings would order task-10 first.
             let a_id = a.try_lock().map(|t| t.id.clone()).unwrap_or_default();
             let b_id = b.try_lock().map(|t| t.id.clone()).unwrap_or_default();
-            a_id.cmp(&b_id)
+            task_number(&a_id).cmp(&task_number(&b_id))
         });
         tasks
     }
+}
+
+/// Numeric suffix of a task id (`task-12` -> 12), for ordering.
+fn task_number(id: &str) -> usize {
+    id.rsplit('-')
+        .next()
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
 }
 
 /// Spawn a shell command in the background and register it with the manager.
@@ -150,14 +159,18 @@ pub async fn spawn_background(
     manager.insert(record.clone()).await;
 
     tokio::spawn(async move {
-        let spawned = Command::new("sh")
+        let mut builder = Command::new("sh");
+        builder
             .arg("-c")
             .arg(&command)
             .current_dir(&workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        // Own process group so the task can be killed as a tree.
+        #[cfg(unix)]
+        builder.process_group(0);
+        let spawned = builder.spawn();
 
         let mut child = match spawned {
             Ok(child) => child,
@@ -358,6 +371,35 @@ mod tests {
 
     fn context() -> ToolContext {
         ToolContext::new(PathBuf::from("/tmp"), AgentMode::Build)
+    }
+
+    #[test]
+    fn task_ids_sort_numerically() {
+        assert_eq!(task_number("task-1"), 1);
+        assert_eq!(task_number("task-10"), 10);
+        assert_eq!(task_number("task-2"), 2);
+        assert!(task_number("task-2") < task_number("task-10"));
+        assert_eq!(task_number("garbage"), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn list_orders_tasks_numerically() {
+        let ctx = context();
+        // Spawn enough tasks that string ordering would put task-10 first.
+        for _ in 0..11 {
+            spawn_background(&ctx.tasks, "true".to_string(), PathBuf::from("/tmp"), 1_000).await;
+        }
+        let ids: Vec<String> = ctx
+            .tasks
+            .list()
+            .await
+            .iter()
+            .map(|task| task.try_lock().map(|t| t.id.clone()).unwrap_or_default())
+            .collect();
+        let numbers: Vec<usize> = ids.iter().map(|id| task_number(id)).collect();
+        let mut sorted = numbers.clone();
+        sorted.sort_unstable();
+        assert_eq!(numbers, sorted, "tasks are not in numeric order: {ids:?}");
     }
 
     #[tokio::test]

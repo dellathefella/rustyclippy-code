@@ -154,6 +154,8 @@ pub struct Totals {
     pub compaction_budget: usize,
     /// Decode speed of the most recent request, in tokens/s.
     pub decode_tokens_per_second: Option<f64>,
+    /// Reasoning ("thinking") tokens accumulated across turns.
+    pub reasoning: usize,
 }
 
 impl Totals {
@@ -192,6 +194,11 @@ pub struct UiFeed {
     busy: bool,
     /// Set when the user asks to interrupt the running turn.
     interrupt: bool,
+    /// True while a reasoning block is streaming, so the transcript can animate
+    /// the thinking rail instead of freezing it.
+    thinking: bool,
+    /// Estimated reasoning tokens streamed so far in the current turn.
+    thinking_tokens: usize,
 }
 
 impl UiFeed {
@@ -242,12 +249,20 @@ impl UiFeed {
         self.revision += 1;
     }
 
-    pub fn add_turn(&mut self, prompt: usize, cached: usize, prefill: usize, completion: usize) {
+    pub fn add_turn(
+        &mut self,
+        prompt: usize,
+        cached: usize,
+        prefill: usize,
+        completion: usize,
+        reasoning: usize,
+    ) {
         self.totals.turns += 1;
         self.totals.prompt += prompt;
         self.totals.cached += cached;
         self.totals.prefill += prefill;
         self.totals.completion += completion;
+        self.totals.reasoning += reasoning;
         self.revision += 1;
     }
 
@@ -270,6 +285,22 @@ impl UiFeed {
 
     pub fn interrupt_requested(&self) -> bool {
         self.interrupt
+    }
+
+    /// Update the live thinking state: whether reasoning is streaming and how
+    /// many tokens it has produced so far.
+    pub fn set_thinking(&mut self, thinking: bool, tokens: usize) {
+        self.thinking = thinking;
+        self.thinking_tokens = tokens;
+        self.revision += 1;
+    }
+
+    pub fn thinking(&self) -> bool {
+        self.thinking
+    }
+
+    pub fn thinking_tokens(&self) -> usize {
+        self.thinking_tokens
     }
 
     /// Clear the interrupt flag once the turn has stopped.
@@ -326,6 +357,8 @@ pub struct Output {
     /// True while a reasoning block is streaming, so the spinner can be
     /// repainted in place instead of printing a new line per chunk.
     thinking: AtomicBool,
+    /// Reasoning tokens streamed in the current turn, estimated from the text.
+    thinking_tokens: AtomicUsize,
 }
 
 impl Clone for Output {
@@ -341,6 +374,7 @@ impl Clone for Output {
             compaction_budget: self.compaction_budget,
             spinner: AtomicUsize::new(self.spinner.load(Ordering::Relaxed)),
             thinking: AtomicBool::new(self.thinking.load(Ordering::Relaxed)),
+            thinking_tokens: AtomicUsize::new(self.thinking_tokens.load(Ordering::Relaxed)),
         }
     }
 }
@@ -361,6 +395,7 @@ impl Output {
             compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
+            thinking_tokens: AtomicUsize::new(0),
         }
     }
 
@@ -378,6 +413,7 @@ impl Output {
             compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
+            thinking_tokens: AtomicUsize::new(0),
         }
     }
 
@@ -394,6 +430,7 @@ impl Output {
             compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
+            thinking_tokens: AtomicUsize::new(0),
         }
     }
 
@@ -410,6 +447,7 @@ impl Output {
             compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
+            thinking_tokens: AtomicUsize::new(0),
         }
     }
 
@@ -569,6 +607,8 @@ impl Output {
         if self.silent() {
             return;
         }
+        // Each turn counts its own thinking tokens.
+        self.thinking_tokens.store(0, Ordering::Relaxed);
         if let Some(feed) = self.feed() {
             if let Ok(mut feed) = feed.lock() {
                 feed.set_busy(true);
@@ -616,7 +656,16 @@ impl Output {
         if self.silent() || !self.show_reasoning() {
             return;
         }
+        // Count thinking tokens as they stream so the footer and the transcript
+        // rail can show progress before the turn finishes.
+        let delta = estimate_tokens(chunk);
+        let tokens = self.thinking_tokens.fetch_add(delta, Ordering::Relaxed) + delta;
         if self.feed().is_some() {
+            if let Some(feed) = self.feed() {
+                if let Ok(mut feed) = feed.lock() {
+                    feed.set_thinking(true, tokens);
+                }
+            }
             self.push(FeedEntry::Reasoning(chunk.to_string()));
             return;
         }
@@ -650,6 +699,11 @@ impl Output {
             return;
         }
         if self.feed().is_some() {
+            if let Some(feed) = self.feed() {
+                if let Ok(mut feed) = feed.lock() {
+                    feed.set_thinking(false, 0);
+                }
+            }
             return;
         }
         if self.thinking.swap(false, Ordering::Relaxed) {
@@ -882,6 +936,7 @@ impl Output {
                         cached,
                         usage.prefill_tokens(),
                         usage.completion_tokens,
+                        usage.reasoning_tokens,
                     );
                     feed.set_busy(false);
                 }
@@ -962,6 +1017,34 @@ impl Output {
         }
         eprintln!("{} {}", self.paint(RED, "error:"), message);
     }
+}
+
+/// Rough token count for a streamed chunk, matching the estimator's heuristic
+/// (CJK counts as one token, other text at ~3.6 chars per token).
+fn estimate_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + ((other as f64) / 3.6).ceil() as usize
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x4E00..=0x9FFF
+        | 0x3400..=0x4DBF
+        | 0x3040..=0x30FF
+        | 0xAC00..=0xD7AF
+        | 0xF900..=0xFAFF
+    )
 }
 
 /// Compact one-line summary of a tool result.

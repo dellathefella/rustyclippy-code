@@ -188,8 +188,20 @@ pub async fn tui(
 
     let session = resolve_session(session, continue_session, &cwd)?;
     let mut agent = match session {
-        Some(id) => Agent::resume(config.clone(), id, output.clone(), yes, Some(runner.clone()))?,
-        None => Agent::new_session(config.clone(), cwd.clone(), output.clone(), yes, Some(runner.clone()))?,
+        Some(id) => Agent::resume(
+            config.clone(),
+            id,
+            output.clone(),
+            yes,
+            Some(runner.clone()),
+        )?,
+        None => Agent::new_session(
+            config.clone(),
+            cwd.clone(),
+            output.clone(),
+            yes,
+            Some(runner.clone()),
+        )?,
     };
 
     print_header(&agent);
@@ -505,7 +517,6 @@ fn handle_command(
         }
     }
 }
-
 
 /// Print report lines to stdout, or route them into the TUI transcript.
 fn emit_lines(output: &Output, lines: Vec<String>) {

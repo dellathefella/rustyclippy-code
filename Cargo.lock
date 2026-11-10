@@ -1426,6 +1426,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -1467,6 +1468,7 @@ dependencies = [
  "async-trait",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "rustyclippy-core",
