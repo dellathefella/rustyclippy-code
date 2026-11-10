@@ -455,6 +455,12 @@ impl Agent {
         let mut last_plan: Option<RequestPlan> = None;
 
         loop {
+            // An interrupt stops the turn between steps, keeping whatever the
+            // model already produced.
+            if self.output.interrupt_requested() {
+                self.output.warning("interrupted");
+                break;
+            }
             // Check before counting so `steps` reports work actually performed.
             if steps >= self.config.agent.max_steps {
                 // Hitting the step ceiling is a truncated turn, not a crash: the
@@ -519,7 +525,19 @@ impl Agent {
             let mut usage = Usage::default();
             let mut assembler = ToolCallAssembler::default();
 
-            while let Some(event) = stream.next().await {
+            // Poll the stream with a timeout so an interrupt is noticed even
+            // when the server stalls between chunks.
+            loop {
+                let next = tokio::select! {
+                    event = stream.next() => event,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                        if self.output.interrupt_requested() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(event) = next else { break };
                 match event? {
                     StreamEvent::Text(chunk) => {
                         text.push_str(&chunk);
@@ -545,6 +563,13 @@ impl Agent {
             }
             if !text.is_empty() {
                 self.output.line_break();
+            }
+            // An interrupt mid-stream discards the partial answer instead of
+            // committing it: the transcript and the session log both keep only
+            // the user message, so a resume replays exactly what was asked.
+            if self.output.interrupt_requested() {
+                self.output.warning("interrupted");
+                break;
             }
             let tool_calls = assembler.finish();
             self.engine.commit(self.transcript.messages());

@@ -251,6 +251,8 @@ async fn run_tui_loop(
                 .turn_summary(agent.turn, &result.usage, result.steps),
             Err(error) => agent.output.error(&format!("{error:#}")),
         }
+        // Reset the interrupt flag so the next turn starts clean.
+        agent.output.clear_interrupt();
         if let Ok(mut feed) = feed.lock() {
             feed.set_busy(false);
         }

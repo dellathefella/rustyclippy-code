@@ -275,7 +275,15 @@ impl Tui {
                 Ok(None)
             }
             KeyCode::Esc => {
-                self.scroll = 0;
+                // While a turn runs, Esc interrupts it so the user can reprompt.
+                // Otherwise it snaps the transcript back to the newest lines.
+                if self.feed.lock().map(|feed| feed.busy()).unwrap_or(false) {
+                    if let Ok(mut feed) = self.feed.lock() {
+                        feed.request_interrupt();
+                    }
+                } else {
+                    self.scroll = 0;
+                }
                 self.dirty = true;
                 Ok(None)
             }
@@ -802,7 +810,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Tot
             Style::default().fg(Color::White),
         ),
         Span::styled(
-            "  ↑↓ scroll · ^V image · ^C quit",
+            "  ↑↓ scroll · esc interrupt · ^V image · ^C quit",
             Style::default().fg(MUTED),
         ),
     ]);
@@ -1107,5 +1115,26 @@ mod tests {
         assert!(feed.busy());
         feed.set_busy(false);
         assert!(!feed.busy());
+    }
+
+    #[test]
+    fn interrupt_flag_round_trips() {
+        let mut feed = UiFeed::default();
+        assert!(!feed.interrupt_requested());
+        feed.request_interrupt();
+        assert!(feed.interrupt_requested());
+        feed.clear_interrupt();
+        assert!(!feed.interrupt_requested());
+    }
+
+    #[test]
+    fn interrupt_is_visible_through_output() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        let output = crate::ui::Output::tui(feed.clone());
+        assert!(!output.interrupt_requested());
+        feed.lock().unwrap().request_interrupt();
+        assert!(output.interrupt_requested());
+        output.clear_interrupt();
+        assert!(!output.interrupt_requested());
     }
 }

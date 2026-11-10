@@ -171,6 +171,8 @@ prompt box; and a footer with live token totals and cache-hit ratio.
 ```text
 ↑ / ↓ / PgUp / PgDn   scroll the transcript (Esc jumps back to the newest line)
 Enter                 submit the prompt
+Esc                   interrupt the running turn, then reprompt
+Ctrl+V                attach the clipboard image
 Ctrl+C                quit
 ```
 

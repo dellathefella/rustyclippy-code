@@ -176,6 +176,8 @@ pub struct UiFeed {
     totals: Totals,
     /// True while a turn is in flight.
     busy: bool,
+    /// Set when the user asks to interrupt the running turn.
+    interrupt: bool,
 }
 
 impl UiFeed {
@@ -226,6 +228,24 @@ impl UiFeed {
 
     pub fn busy(&self) -> bool {
         self.busy
+    }
+
+    /// Ask the running turn to stop. The agent checks this between steps and
+    /// while streaming, so an interrupt lands promptly without killing the
+    /// process.
+    pub fn request_interrupt(&mut self) {
+        self.interrupt = true;
+        self.revision += 1;
+    }
+
+    pub fn interrupt_requested(&self) -> bool {
+        self.interrupt
+    }
+
+    /// Clear the interrupt flag once the turn has stopped.
+    pub fn clear_interrupt(&mut self) {
+        self.interrupt = false;
+        self.revision += 1;
     }
 
     /// Register a pending approval request and the channel that answers it.
@@ -375,6 +395,22 @@ impl Output {
     /// True when output is routed into a TUI transcript.
     pub fn is_tui(&self) -> bool {
         self.feed().is_some()
+    }
+
+    /// True when the user asked to interrupt the running turn.
+    pub fn interrupt_requested(&self) -> bool {
+        self.feed()
+            .and_then(|feed| feed.lock().ok().map(|feed| feed.interrupt_requested()))
+            .unwrap_or(false)
+    }
+
+    /// Clear the interrupt flag after a turn stops.
+    pub fn clear_interrupt(&self) {
+        if let Some(feed) = self.feed() {
+            if let Ok(mut feed) = feed.lock() {
+                feed.clear_interrupt();
+            }
+        }
     }
 
     /// Clear the transcript pane (TUI only).

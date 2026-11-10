@@ -56,6 +56,15 @@ impl Transcript {
         self.compactions.last()
     }
 
+    /// Drop messages appended after `len`, used to roll back an interrupted
+    /// turn. The pinned head and compaction summaries are never removed: an
+    /// interrupt can only discard messages the current turn added.
+    pub fn truncate(&mut self, len: usize) {
+        let floor = self.head_len.min(self.messages.len());
+        let keep = len.max(floor).min(self.messages.len());
+        self.messages.truncate(keep);
+    }
+
     /// Append one message. This is the only growth operation.
     pub fn append(&mut self, message: Message) {
         self.messages.push(message);
@@ -149,6 +158,18 @@ mod tests {
             transcript.append(Message::assistant(format!("step {index}")));
         }
         transcript
+    }
+
+    #[test]
+    fn truncate_never_removes_the_pinned_head() {
+        let mut transcript = build_transcript();
+        assert_eq!(transcript.len(), 8);
+        transcript.truncate(4);
+        assert_eq!(transcript.len(), 4);
+        transcript.truncate(0);
+        assert_eq!(transcript.len(), 2, "head must survive a rollback");
+        transcript.truncate(99);
+        assert_eq!(transcript.len(), 2, "truncate cannot grow the transcript");
     }
 
     #[test]
