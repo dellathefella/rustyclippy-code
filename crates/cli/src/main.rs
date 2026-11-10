@@ -5,6 +5,7 @@ mod commands;
 mod history;
 mod images;
 mod input;
+mod permissions;
 mod subagent_runner;
 mod tui;
 mod ui;
@@ -64,9 +65,6 @@ enum Command {
         /// Emit a JSON result instead of streaming text
         #[arg(long)]
         json: bool,
-        /// Override the maximum agent steps
-        #[arg(long)]
-        max_steps: Option<usize>,
         /// Attach an image file to the prompt (repeatable)
         #[arg(long = "image", value_name = "PATH")]
         images: Vec<PathBuf>,
@@ -169,7 +167,16 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    // A panic inside the TUI would otherwise leave the terminal in raw mode on
+    // the alternate screen, so restore it before the default hook prints.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::tui::restore_terminal();
+        default_hook(info);
+    }));
+
     if let Err(error) = run().await {
+        crate::tui::restore_terminal();
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
@@ -201,7 +208,6 @@ async fn run() -> Result<()> {
                     mode,
                     yes,
                     json,
-                    max_steps,
                     images,
                 } => {
                     let text = prompt.join(" ");
@@ -216,7 +222,6 @@ async fn run() -> Result<()> {
                         mode,
                         yes,
                         json,
-                        max_steps,
                         images,
                     )
                     .await

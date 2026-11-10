@@ -207,8 +207,17 @@ pub async fn run_shell(
         .spawn()
         .with_context(|| format!("spawning command in {}", workdir.display()))?;
 
-    let stdout_pipe = child.stdout.take().expect("stdout pipe");
-    let stderr_pipe = child.stderr.take().expect("stderr pipe");
+    // Both pipes are requested above, so a missing one means the spawn failed
+    // in a way we cannot recover from. Report it instead of panicking: a panic
+    // inside a tool would take down the whole session.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .context("command produced no stdout pipe")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("command produced no stderr pipe")?;
     let stdout_task = tokio::spawn(read_all(stdout_pipe));
     let stderr_task = tokio::spawn(read_all(stderr_pipe));
 

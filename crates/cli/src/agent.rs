@@ -21,6 +21,7 @@ use rustyclippy_llm::{build_provider, FinishReason, LlmRequest, Provider, Stream
 use rustyclippy_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
 use serde_json::Value;
 
+use crate::permissions::is_read_only_command;
 use crate::ui::{fmt_num, tool_detail, ApprovalAnswer, ApprovalRequest, Output};
 
 #[derive(Default)]
@@ -143,262 +144,6 @@ fn describe(call: &ToolCall) -> String {
     describe_args(&call.name, &call.arguments)
 }
 
-/// Commands that only inspect the workspace. Anything else prompts.
-///
-/// `git` is deliberately absent: it is handled by [`git_is_read_only`], because
-/// a blanket allow would let `git branch -D` and `git config --global` run
-/// without approval.
-const READ_ONLY_COMMANDS: &[&str] = &[
-    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "fd", "tree", "file", "stat", "du",
-    "pwd", "echo", "which", "type", "env", "printenv", "date", "uname", "whoami", "basename",
-    "dirname", "realpath", "readlink", "diff", "sort", "uniq", "cut", "tr", "sed", "awk", "jq",
-    "true", "false", "test",
-];
-
-/// Subcommands that mutate even though the binary is read-only.
-const MUTATING_SUBCOMMANDS: &[&str] = &[
-    "commit",
-    "push",
-    "pull",
-    "merge",
-    "rebase",
-    "reset",
-    "checkout",
-    "switch",
-    "clean",
-    "rm",
-    "mv",
-    "add",
-    "stash",
-    "tag",
-    "init",
-    "clone",
-    "install",
-    "publish",
-    "run",
-    "build",
-    "test",
-    "fix",
-    "fmt",
-    "update",
-    "remove",
-    "delete",
-    "apply",
-    "restore",
-    "cherry-pick",
-    "revert",
-];
-
-/// Git subcommands that never write to the repository.
-const READ_ONLY_GIT_SUBCOMMANDS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "blame",
-    "describe",
-    "rev-parse",
-    "ls-files",
-    "ls-tree",
-    "cat-file",
-    "shortlog",
-    "whatchanged",
-    "grep",
-    "count-objects",
-    "for-each-ref",
-    "show-ref",
-    "merge-base",
-    "name-rev",
-    "rev-list",
-    "help",
-    "version",
-    "check-ignore",
-    "check-attr",
-    "var",
-];
-
-/// Git subcommands that read only when their own arguments say so.
-const CONDITIONAL_GIT_SUBCOMMANDS: &[&str] = &[
-    "branch",
-    "tag",
-    "remote",
-    "stash",
-    "config",
-    "worktree",
-    "notes",
-    "submodule",
-];
-
-/// Git flags that write, even under an otherwise read-only subcommand.
-const MUTATING_GIT_FLAGS: &[&str] = &[
-    "-d",
-    "-D",
-    "-m",
-    "-M",
-    "-f",
-    "--force",
-    "--delete",
-    "--move",
-    "--rename",
-    "--set",
-    "--unset",
-    "--unset-all",
-    "--add",
-    "--replace-all",
-    "--edit",
-    "-e",
-    "--prune",
-    "--update",
-    "-u",
-    "--hard",
-    "--soft",
-    "--mixed",
-    "--keep",
-    "--orphan",
-    "--detach",
-    "--amend",
-    "--squash",
-];
-
-/// Git `config` flags that read instead of write.
-const READ_ONLY_GIT_CONFIG_FLAGS: &[&str] = &["--get", "--get-all", "--get-regexp", "--list", "-l"];
-
-/// Git subcommands whose read-only form is a specific sub-subcommand.
-const READ_ONLY_GIT_SUBSUBCOMMANDS: &[(&str, &[&str])] = &[
-    ("stash", &["list", "show"]),
-    ("worktree", &["list"]),
-    ("notes", &["list", "show"]),
-    ("submodule", &["status", "summary"]),
-    ("remote", &["show", "get-url"]),
-];
-
-/// True when a `git` invocation only inspects the repository.
-fn git_is_read_only(words: &[&str]) -> bool {
-    // Skip global flags such as `--no-pager`, `-C <dir>` or `--git-dir=<path>`.
-    let mut index = 0;
-    while index < words.len() && words[index].starts_with('-') {
-        index += 1;
-    }
-    let Some(subcommand) = words.get(index) else {
-        return false;
-    };
-    let rest = &words[index + 1..];
-
-    if READ_ONLY_GIT_SUBCOMMANDS.contains(subcommand) {
-        return true;
-    }
-    if !CONDITIONAL_GIT_SUBCOMMANDS.contains(subcommand) {
-        return false;
-    }
-
-    // `git config` writes unless an explicit read flag is present.
-    if *subcommand == "config" {
-        return rest
-            .iter()
-            .any(|word| READ_ONLY_GIT_CONFIG_FLAGS.contains(word));
-    }
-
-    // Some subcommands read only through a named sub-subcommand.
-    if let Some((_, allowed)) = READ_ONLY_GIT_SUBSUBCOMMANDS
-        .iter()
-        .find(|(name, _)| name == subcommand)
-    {
-        let Some(first) = rest.first() else {
-            return false;
-        };
-        return allowed.contains(first);
-    }
-
-    // `branch`, `tag`: read only when no mutating flag is present.
-    !rest.iter().any(|word| MUTATING_GIT_FLAGS.contains(word))
-}
-
-/// Flags that write for a specific binary. `grep -o` is read-only, so the
-/// check has to be per-binary rather than a blanket flag list.
-fn binary_flags_mutate(binary: &str, words: &[&str]) -> bool {
-    match binary {
-        "sed" => words.iter().any(|word| {
-            word.starts_with("--in-place") || (word.starts_with("-i") && !word.starts_with("--"))
-        }),
-        "sort" => words
-            .iter()
-            .any(|word| *word == "-o" || word.starts_with("--output")),
-        "awk" => words.iter().any(|word| {
-            word.starts_with("--in-place") || (word.starts_with("-i") && !word.starts_with("--"))
-        }),
-        "find" => words.iter().any(|word| {
-            matches!(
-                *word,
-                "-delete"
-                    | "-exec"
-                    | "-execdir"
-                    | "-ok"
-                    | "-okdir"
-                    | "-fprint"
-                    | "-fwrite"
-                    | "-fls"
-            )
-        }),
-        _ => false,
-    }
-}
-
-/// True when a shell command only reads. Conservative: any redirection, any
-/// unknown binary, any mutating subcommand, or any mutating flag counts as a
-/// mutation.
-fn is_read_only_command(command: &str) -> bool {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // Redirection, backgrounding, or command substitution can write.
-    if trimmed.contains('>')
-        || trimmed.contains('<')
-        || trimmed.contains('`')
-        || trimmed.contains("$(")
-        || trimmed.contains('&')
-    {
-        return false;
-    }
-    for segment in trimmed.split(['|', ';', '\n']) {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-        let words: Vec<&str> = segment.split_whitespace().collect();
-        let Some(binary) = words.first() else {
-            continue;
-        };
-        // Strip a leading path so `/bin/ls` is recognized.
-        let binary = binary.rsplit('/').next().unwrap_or(binary);
-
-        if binary == "git" {
-            if !git_is_read_only(&words[1..]) {
-                return false;
-            }
-            continue;
-        }
-        if !READ_ONLY_COMMANDS.contains(&binary) {
-            return false;
-        }
-        // `sed -i`, `sort -o`, `find -delete` write despite a read-only binary.
-        if binary_flags_mutate(binary, &words[1..]) {
-            return false;
-        }
-        // `cargo build`, `git commit` and friends write via their subcommand.
-        for word in &words[1..] {
-            let word = word.trim_start_matches('-');
-            if MUTATING_SUBCOMMANDS.contains(&word) {
-                return false;
-            }
-            if word == "i" || word == "delete" || word == "exec" || word == "execdir" {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 fn describe_args(name: &str, args: &Value) -> String {
     tool_detail(name, args)
 }
@@ -467,6 +212,70 @@ impl Agent {
             tool_ctx,
             system,
             output,
+            auto_approve,
+            approved_paths: HashSet::new(),
+            approved_commands: HashSet::new(),
+        })
+    }
+
+    /// Build an agent around an injected provider and session store.
+    ///
+    /// Used by tests to drive a full turn against a mock provider without a
+    /// live server, and without writing into the real session home.
+    #[cfg(test)]
+    pub fn with_provider(
+        config: Config,
+        cwd: PathBuf,
+        provider: Arc<dyn Provider>,
+        store: SessionStore,
+        auto_approve: bool,
+    ) -> Result<Self> {
+        let mode = config.agent.mode;
+        let system = system_prompt(mode);
+        let registry = ToolRegistry::standard(mode);
+        let engine = CacheEngine::new(&system, &registry.schemas(), config.cache.granularity);
+        let mut transcript = Transcript::new(config.cache.head_messages);
+        let environment = environment_message(&cwd.to_string_lossy(), &config.provider.model);
+        transcript.append(environment.clone());
+
+        let session_id = SessionStore::new_session_id();
+        let meta = SessionMeta {
+            id: session_id.clone(),
+            cwd: cwd.to_string_lossy().to_string(),
+            provider: config.provider.kind.as_str().to_string(),
+            model: config.provider.model.clone(),
+            mode: mode.as_str().to_string(),
+            system_hash: engine.system_hash().to_string(),
+            tools_hash: engine.tools_hash().to_string(),
+            system_prompt: system.clone(),
+            created_at: Utc::now(),
+        };
+        store.create(meta)?;
+        store.append(
+            &session_id,
+            &SessionEvent::Message {
+                message: environment,
+            },
+        )?;
+
+        let mut tool_ctx = ToolContext::new(cwd, mode);
+        tool_ctx.max_output_chars = config.cache.tool_output_max_chars;
+        tool_ctx.web = config.web.clone();
+        tool_ctx.max_depth = config.agent.max_depth;
+
+        Ok(Self {
+            config,
+            provider,
+            registry,
+            transcript,
+            engine,
+            store,
+            session_id,
+            mode,
+            turn: 0,
+            tool_ctx,
+            system,
+            output: Output::new(false),
             auto_approve,
             approved_paths: HashSet::new(),
             approved_commands: HashSet::new(),
@@ -668,19 +477,10 @@ impl Agent {
                 self.output.warning("interrupted");
                 break;
             }
-            // Check before counting so `steps` reports work actually performed.
-            if steps >= self.config.agent.max_steps {
-                // Hitting the step ceiling is a truncated turn, not a crash: the
-                // work already done stays in the transcript and the session log,
-                // and the user can ask the agent to continue. Bailing here would
-                // discard the partial answer and leave the turn unclosed.
-                self.output.warning(&format!(
-                    "stopped after {} steps without a final answer; the turn is incomplete \
-                     (raise agent.max_steps to allow longer runs)",
-                    self.config.agent.max_steps
-                ));
-                break;
-            }
+            // No step ceiling: a turn runs until the model stops asking for
+            // tools. The loop is bounded by the interrupt flag, the context
+            // budget (which forces compaction) and the provider's own limits,
+            // so an unbounded loop cannot spin forever without progress.
             steps += 1;
 
             let mut plan = self.engine.plan(
@@ -1214,102 +1014,210 @@ mod tests {
         assert!(describe(&call).chars().count() <= 121);
     }
 
-    #[test]
-    fn read_only_commands_do_not_prompt() {
-        for command in [
-            "ls -la",
-            "cat src/main.rs",
-            "grep -rn foo crates/",
-            "git status",
-            "git log --oneline",
-            "git diff HEAD",
-            "find . -name '*.rs'",
-            "head -20 README.md | wc -l",
-            "/bin/ls",
-            // `grep -o` is read-only; the flag check must be per-binary.
-            "grep -o foo file.rs",
-            "sort file.txt",
-            "sed 's/a/b/' file.rs",
-            "git branch",
-            "git branch --list",
-            "git tag",
-            "git remote show origin",
-            "git stash list",
-            "git worktree list",
-            "git config --get user.name",
-            "git config --list",
-            "git rev-parse HEAD",
-            "git --no-pager log -1",
-        ] {
-            assert!(
-                is_read_only_command(command),
-                "{command} should be read-only"
-            );
+    /// A provider that replays a fixed script of stream events.
+    struct MockProvider {
+        script: Vec<Vec<StreamEvent>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn boxed(script: Vec<Vec<StreamEvent>>) -> Arc<dyn Provider> {
+            Arc::new(Self {
+                script,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
         }
     }
 
-    #[test]
-    fn mutating_git_commands_prompt() {
-        // These previously slipped through because `git` was blanket-allowed.
-        for command in [
-            "git branch -D feature",
-            "git branch -d feature",
-            "git branch -m old new",
-            "git tag -d v1",
-            "git tag -f v1",
-            "git config --global user.name x",
-            "git config user.email x",
-            "git config --unset user.name",
-            "git remote add origin url",
-            "git remote remove origin",
-            "git stash",
-            "git stash drop",
-            "git worktree add ../wt",
-            "git gc",
-            "git fetch origin",
-            "git checkout main",
-            "git reset --hard",
-            "git clean -fd",
-            "git submodule update",
-            "git notes add -m x",
-        ] {
-            assert!(!is_read_only_command(command), "{command} should prompt");
+    #[async_trait::async_trait]
+    impl Provider for MockProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<futures_util::stream::BoxStream<'static, Result<StreamEvent>>> {
+            let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = self.script.get(index).cloned().unwrap_or_default();
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
         }
     }
 
-    #[test]
-    fn mutating_flags_prompt_even_for_read_only_binaries() {
-        for command in [
-            "sed --in-place 's/a/b/' f.rs",
-            "sed -i.bak 's/a/b/' f.rs",
-            "sort -o out.txt in.txt",
-            "sort --output=out.txt in.txt",
-            "awk -i inplace '{print}' f",
-            "find . -exec rm {} \\;",
-            "find . -fprint out.txt",
-        ] {
-            assert!(!is_read_only_command(command), "{command} should prompt");
-        }
+    fn test_config() -> Config {
+        Config::default()
     }
 
-    #[test]
-    fn mutating_commands_still_prompt() {
-        for command in [
-            "rm -rf target",
-            "echo hi > file.txt",
-            "git commit -m x",
-            "cargo build",
-            "sed -i 's/a/b/' file.rs",
-            "find . -delete",
-            "npm install",
-            "cargo check",
-            "node script.js",
-            "curl http://example.com",
-            "ls && rm x",
-            "cat $(echo secret)",
-        ] {
-            assert!(!is_read_only_command(command), "{command} should prompt");
-        }
+    #[tokio::test]
+    async fn a_turn_streams_text_and_closes_the_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let provider = MockProvider::boxed(vec![vec![
+            StreamEvent::Text("hello ".into()),
+            StreamEvent::Text("world".into()),
+            StreamEvent::Finished(FinishReason::Stop),
+            StreamEvent::Done,
+        ]]);
+        let mut agent = Agent::with_provider(
+            test_config(),
+            dir.path().to_path_buf(),
+            provider,
+            store,
+            true,
+        )
+        .unwrap();
+
+        let result = agent.run_turn("hi").await.unwrap();
+        assert_eq!(result.text, "hello world");
+        assert_eq!(result.steps, 1);
+
+        // The turn must be closed in the log, or `--continue` resumes with a
+        // stale counter.
+        let events = agent.store.load(&agent.session_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::TurnEnd { turn: 1, .. })),
+            "turn end missing from session log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_runs_and_its_result_joins_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let provider = MockProvider::boxed(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("read".into()),
+                    args_fragment: Some(r#"{"path":"a.txt"}"#.into()),
+                },
+                StreamEvent::Finished(FinishReason::ToolCalls),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::Text("done".into()),
+                StreamEvent::Finished(FinishReason::Stop),
+                StreamEvent::Done,
+            ],
+        ]);
+        let mut agent = Agent::with_provider(
+            test_config(),
+            dir.path().to_path_buf(),
+            provider,
+            store,
+            true,
+        )
+        .unwrap();
+
+        let result = agent.run_turn("read a.txt").await.unwrap();
+        assert_eq!(result.text, "done");
+        assert_eq!(result.steps, 2);
+
+        // The tool result must be in the transcript so the next request sees it.
+        let messages = agent.transcript.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == Role::Tool && message.content.contains("alpha")),
+            "tool result missing from transcript: {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mutating_command_is_denied_without_approval() {
+        // `auto_approve=false` and no interactive answerer means the approval
+        // prompt cannot be answered, so the call must be denied rather than run.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let provider = MockProvider::boxed(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("bash".into()),
+                    args_fragment: Some(r#"{"command":"rm -rf /tmp/nope"}"#.into()),
+                },
+                StreamEvent::Finished(FinishReason::ToolCalls),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::Text("stopped".into()),
+                StreamEvent::Finished(FinishReason::Stop),
+                StreamEvent::Done,
+            ],
+        ]);
+        let mut agent = Agent::with_provider(
+            test_config(),
+            dir.path().to_path_buf(),
+            provider,
+            store,
+            false,
+        )
+        .unwrap();
+
+        agent.run_turn("delete it").await.unwrap();
+        let messages = agent.transcript.messages();
+        let tool_message = messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("tool result");
+        assert!(
+            !tool_message.content.contains("exit 0"),
+            "mutating command must not run unapproved: {}",
+            tool_message.content
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_command_runs_without_approval() {
+        // `ls` is read-only, so it must execute even with auto_approve=false.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let provider = MockProvider::boxed(vec![
+            vec![
+                StreamEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("bash".into()),
+                    args_fragment: Some(r#"{"command":"ls"}"#.into()),
+                },
+                StreamEvent::Finished(FinishReason::ToolCalls),
+                StreamEvent::Done,
+            ],
+            vec![
+                StreamEvent::Text("listed".into()),
+                StreamEvent::Finished(FinishReason::Stop),
+                StreamEvent::Done,
+            ],
+        ]);
+        let mut agent = Agent::with_provider(
+            test_config(),
+            dir.path().to_path_buf(),
+            provider,
+            store,
+            false,
+        )
+        .unwrap();
+
+        agent.run_turn("list files").await.unwrap();
+        let messages = agent.transcript.messages();
+        let tool_message = messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("tool result");
+        assert!(
+            tool_message.content.contains("marker.txt"),
+            "read-only command should run: {}",
+            tool_message.content
+        );
     }
 
     #[test]
@@ -1400,7 +1308,23 @@ mod step_limit {
     use tempfile::TempDir;
 
     /// Always answers with a tool call, so the agent never finishes on its own.
-    struct EndlessToolProvider;
+    /// Requests a tool for the first `tool_steps` calls, then answers.
+    ///
+    /// With no step ceiling the loop only ends when the model stops asking for
+    /// tools, so the mock has to eventually produce a final answer.
+    struct EndlessToolProvider {
+        tool_steps: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EndlessToolProvider {
+        fn new(tool_steps: usize) -> Self {
+            Self {
+                tool_steps,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
 
     #[async_trait]
     impl Provider for EndlessToolProvider {
@@ -1412,30 +1336,39 @@ mod step_limit {
             &self,
             _request: LlmRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
-            let events = vec![
-                Ok(StreamEvent::ToolCallDelta {
-                    index: 0,
-                    id: Some("call_1".into()),
-                    name: Some("todo".into()),
-                    args_fragment: Some(r#"{"items":[]}"#.into()),
-                }),
-                Ok(StreamEvent::Usage(Usage {
-                    prompt_tokens: 100,
-                    cached_tokens: 80,
-                    completion_tokens: 5,
-                    reasoning_tokens: 0,
-                    decode_tokens_per_second: None,
-                })),
-                Ok(StreamEvent::Done),
-            ];
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = if call < self.tool_steps {
+                vec![
+                    Ok(StreamEvent::ToolCallDelta {
+                        index: 0,
+                        id: Some(format!("call_{call}")),
+                        name: Some("todo".into()),
+                        args_fragment: Some(r#"{"items":[]}"#.into()),
+                    }),
+                    Ok(StreamEvent::Usage(Usage {
+                        prompt_tokens: 100,
+                        cached_tokens: 80,
+                        completion_tokens: 5,
+                        reasoning_tokens: 0,
+                        decode_tokens_per_second: None,
+                    })),
+                    Ok(StreamEvent::Finished(FinishReason::ToolCalls)),
+                    Ok(StreamEvent::Done),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::Text("finished".into())),
+                    Ok(StreamEvent::Finished(FinishReason::Stop)),
+                    Ok(StreamEvent::Done),
+                ]
+            };
             Ok(Box::pin(stream::iter(events)))
         }
     }
 
-    fn agent_with_limit(max_steps: usize) -> (Agent, TempDir) {
+    fn agent_with_auto_permissions() -> (Agent, TempDir) {
         let dir = TempDir::new().unwrap();
         let mut config = Config::default();
-        config.agent.max_steps = max_steps;
         config.permissions.bash = rustyclippy_core::PermissionMode::Auto;
         config.permissions.edit = rustyclippy_core::PermissionMode::Auto;
         config.permissions.write = rustyclippy_core::PermissionMode::Auto;
@@ -1449,7 +1382,7 @@ mod step_limit {
             None,
         )
         .unwrap();
-        agent.provider = Arc::new(EndlessToolProvider);
+        agent.provider = Arc::new(EndlessToolProvider::new(5));
         agent.store = SessionStore::new(dir.path().to_path_buf());
         agent
             .store
@@ -1499,7 +1432,7 @@ mod step_limit {
 
     #[tokio::test]
     async fn truncation_is_reported_not_silently_committed() {
-        let (mut agent, _dir) = agent_with_limit(3);
+        let (mut agent, _dir) = agent_with_auto_permissions();
         agent.provider = Arc::new(TruncatedProvider);
         // Route chrome into a feed so the warning can be asserted.
         let feed = Arc::new(std::sync::Mutex::new(crate::ui::UiFeed::default()));
@@ -1533,23 +1466,25 @@ mod step_limit {
     }
 
     #[tokio::test]
-    async fn hitting_the_step_limit_closes_the_turn() {
-        let (mut agent, _dir) = agent_with_limit(3);
+    async fn a_turn_runs_until_the_model_stops_asking_for_tools() {
+        // There is no step ceiling: the loop ends when the model returns a
+        // final answer, not when a counter runs out.
+        let (mut agent, _dir) = agent_with_auto_permissions();
         let result = agent.run_turn_with_images("keep going", Vec::new()).await;
 
-        // The turn is truncated, not an error: the caller still gets a result.
-        let result = result.expect("step limit should truncate, not fail");
-        assert_eq!(result.steps, 3, "stops at the configured ceiling");
+        let result = result.expect("an unbounded turn should still complete");
+        assert!(
+            result.steps > 3,
+            "the loop must keep going past the old ceiling, got {} steps",
+            result.steps
+        );
 
         let events = agent.store.load(&agent.session_id).unwrap();
         let turn_ends = events
             .iter()
             .filter(|event| matches!(event, SessionEvent::TurnEnd { .. }))
             .count();
-        assert_eq!(
-            turn_ends, 1,
-            "the truncated turn is still closed in the log"
-        );
+        assert_eq!(turn_ends, 1, "the turn is closed in the log");
 
         let summaries = agent.store.list().unwrap();
         let summary = summaries
@@ -1557,12 +1492,12 @@ mod step_limit {
             .find(|summary| summary.id == agent.session_id)
             .unwrap();
         assert_eq!(summary.turns, 1, "the turn is counted");
-        assert!(summary.messages > 1, "partial work is preserved");
+        assert!(summary.messages > 1, "work is preserved");
     }
 
     #[tokio::test]
     async fn a_failed_turn_still_closes_the_log() {
-        let (mut agent, _dir) = agent_with_limit(3);
+        let (mut agent, _dir) = agent_with_auto_permissions();
         // Force a failure inside the loop: an unknown tool trips the guard.
         agent.registry = ToolRegistry::standard(AgentMode::Build);
         let _result = agent.run_turn_with_images("x", Vec::new()).await;

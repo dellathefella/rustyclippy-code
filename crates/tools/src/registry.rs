@@ -180,21 +180,50 @@ impl ToolRegistry {
     }
 }
 
+/// Truncate `text` to at most `max` characters.
+///
+/// The budget is counted in characters, not bytes: `max_output_chars` is named
+/// in chars, and comparing bytes would cut CJK output to a third of the
+/// configured size (each glyph is three bytes in UTF-8).
 pub fn truncate(text: &str, max: usize) -> String {
-    if text.len() <= max {
+    let chars = text.chars().count();
+    if chars <= max {
         return text.to_string();
     }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let omitted = text.len() - end;
-    format!("{}…\n[truncated {omitted} bytes]", &text[..end])
+    let kept: String = text.chars().take(max).collect();
+    let omitted = chars - max;
+    format!("{kept}…\n[truncated {omitted} chars]")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_counts_chars_not_bytes() {
+        // CJK glyphs are three bytes each, so a byte-based budget would cut
+        // this to a third of the requested size.
+        let cjk = "日".repeat(12_000);
+        let out = truncate(&cjk, 12_000);
+        assert_eq!(out, cjk, "text at the budget must pass through unchanged");
+
+        let out = truncate(&cjk, 5_000);
+        assert!(out.starts_with(&"日".repeat(5_000)));
+        assert!(out.contains("[truncated 7000 chars]"));
+        // 5000 kept chars plus the ellipsis and the notice.
+        assert_eq!(
+            out.chars().count(),
+            5_000 + "…\n[truncated 7000 chars]".chars().count()
+        );
+    }
+
+    #[test]
+    fn truncate_is_char_boundary_safe() {
+        let text = "日本語テキスト";
+        let out = truncate(text, 3);
+        assert!(out.starts_with("日本語"));
+        assert!(out.contains("[truncated 4 chars]"));
+    }
 
     #[test]
     fn schemas_are_sorted_and_stable() {

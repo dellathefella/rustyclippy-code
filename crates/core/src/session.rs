@@ -172,6 +172,10 @@ impl SessionStore {
             .with_context(|| format!("opening session log {}", path.display()))?;
         let line = serde_json::to_string(event)?;
         writeln!(file, "{line}")?;
+        // Flush to disk so a crash cannot leave a half-written line that makes
+        // the whole session unreplayable.
+        file.sync_all()
+            .with_context(|| format!("syncing session log {}", path.display()))?;
         Ok(())
     }
 
@@ -184,6 +188,8 @@ impl SessionStore {
             .with_context(|| format!("opening cache log {}", path.display()))?;
         let line = serde_json::to_string(record)?;
         writeln!(file, "{line}")?;
+        file.sync_all()
+            .with_context(|| format!("syncing cache log {}", path.display()))?;
         Ok(())
     }
 
@@ -192,14 +198,34 @@ impl SessionStore {
         let file = File::open(&path)
             .with_context(|| format!("session {} not found at {}", id, path.display()))?;
         let reader = BufReader::new(file);
+        let lines: Vec<String> = reader
+            .lines()
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("reading {}", path.display()))?;
+        let total = lines.len();
         let mut events = Vec::new();
-        for (line_no, line) in reader.lines().enumerate() {
-            let line = line?;
+        for (line_no, line) in lines.iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let event: SessionEvent = serde_json::from_str(&line)
-                .with_context(|| format!("parsing {} line {}", path.display(), line_no + 1))?;
+            let event: SessionEvent = match serde_json::from_str(line) {
+                Ok(event) => event,
+                Err(error) => {
+                    // A crash mid-write can leave a truncated final line. Drop
+                    // it rather than refusing to replay the whole session; any
+                    // earlier corruption is still reported.
+                    if line_no + 1 == total {
+                        eprintln!(
+                            "warning: ignoring truncated final line in {}: {error}",
+                            path.display()
+                        );
+                        break;
+                    }
+                    return Err(error).with_context(|| {
+                        format!("parsing {} line {}", path.display(), line_no + 1)
+                    });
+                }
+            };
             events.push(event);
         }
         Ok(events)
@@ -328,6 +354,45 @@ mod tests {
             system_prompt: "sys".to_string(),
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn truncated_final_line_is_ignored() {
+        // A crash mid-write leaves a partial JSON line; replay must keep the
+        // events before it instead of failing outright.
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.create(meta("s1")).unwrap();
+        store
+            .append(
+                "s1",
+                &SessionEvent::Message {
+                    message: Message::user("hello"),
+                },
+            )
+            .unwrap();
+
+        let path = store.log_path("s1");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"type\":\"message\",\"message\":{\"role\":\"user\"");
+        std::fs::write(&path, text).unwrap();
+
+        let events = store.load("s1").unwrap();
+        assert_eq!(events.len(), 2, "created + one message survive");
+    }
+
+    #[test]
+    fn corruption_before_the_last_line_still_fails() {
+        // Only the final line may be truncated; earlier corruption is real.
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        store.create(meta("s2")).unwrap();
+        let path = store.log_path("s2");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("not json\n");
+        text.push_str("{\"type\":\"message\"}");
+        std::fs::write(&path, text).unwrap();
+        assert!(store.load("s2").is_err());
     }
 
     #[test]

@@ -28,15 +28,11 @@ pub async fn run(
     mode: Option<String>,
     yes: bool,
     json: bool,
-    max_steps: Option<usize>,
     image_paths: Vec<PathBuf>,
 ) -> Result<()> {
     let mut config = config;
     if let Some(mode) = mode {
         config.agent.mode = AgentMode::parse(&mode)?;
-    }
-    if let Some(steps) = max_steps {
-        config.agent.max_steps = steps;
     }
     let output = Output::new(json);
     let cwd = std::env::current_dir().context("resolving current directory")?;

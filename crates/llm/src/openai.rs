@@ -30,6 +30,8 @@ pub struct OpenAiProvider {
     flavor: Flavor,
     client: reqwest::Client,
     timeout: Duration,
+    /// Retries for transient failures (429/5xx). `0` disables retry.
+    max_retries: u32,
 }
 
 impl OpenAiProvider {
@@ -57,6 +59,7 @@ impl OpenAiProvider {
             flavor,
             client,
             timeout: Duration::from_secs(config.timeout_secs),
+            max_retries: config.max_retries,
         })
     }
 
@@ -148,6 +151,85 @@ impl OpenAiProvider {
     }
 }
 
+impl OpenAiProvider {
+    /// POST the request, retrying transient failures with exponential backoff.
+    ///
+    /// A local server restarting, a hosted API rate limit, or a gateway hiccup
+    /// would otherwise kill the whole turn. Only 429 and 5xx are retried: a 4xx
+    /// is a request problem that retrying cannot fix.
+    async fn send_with_retry(
+        &self,
+        headers: &HeaderMap,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            let response = self
+                .client
+                .post(self.endpoint())
+                .headers(headers.clone())
+                .json(body)
+                .send()
+                .await
+                .with_context(|| format!("POST {}", self.endpoint()))?;
+
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+
+            let retryable =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            if !retryable || attempt >= self.max_retries {
+                let text = response.text().await.unwrap_or_default();
+                bail!(
+                    "provider returned HTTP {status}: {}",
+                    truncate(&text, 2_000)
+                );
+            }
+
+            // Honor `Retry-After` when the server sends it, otherwise back off
+            // exponentially: 1s, 2s, 4s, ...
+            let delay = retry_after(&response).unwrap_or_else(|| backoff(attempt));
+            attempt += 1;
+            tracing::warn!(
+                "provider returned HTTP {status}; retrying in {}s (attempt {attempt}/{})",
+                delay.as_secs(),
+                self.max_retries
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+/// Parse a `Retry-After` header, which may be seconds or an HTTP date.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let value = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    parse_retry_after(value)
+}
+
+/// Parse a `Retry-After` value: seconds, or an HTTP date (fixed fallback).
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds.min(60)));
+    }
+    // HTTP-date form: fall back to a fixed delay rather than parsing dates.
+    Some(Duration::from_secs(5))
+}
+
+/// Exponential backoff for attempt `n`: 1s, 2s, 4s, ... capped at 64s.
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(6))
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     fn name(&self) -> &str {
@@ -171,23 +253,7 @@ impl Provider for OpenAiProvider {
             headers.insert(AUTHORIZATION, value);
         }
 
-        let response = self
-            .client
-            .post(self.endpoint())
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {}", self.endpoint()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            bail!(
-                "provider returned HTTP {status}: {}",
-                truncate(&text, 2_000)
-            );
-        }
+        let response = self.send_with_retry(&headers, &body).await?;
 
         // Image requests are sent non-streaming (see `build_body`); turn the
         // complete response into the same event sequence the SSE path emits.
@@ -433,6 +499,40 @@ fn truncate(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_seconds_are_honored_and_capped() {
+        assert_eq!(parse_retry_after("7"), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("9999"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn retry_after_http_date_falls_back() {
+        assert_eq!(
+            parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn retry_after_garbage_is_none() {
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn backoff_grows_exponentially() {
+        assert_eq!(backoff(0), Duration::from_secs(1));
+        assert_eq!(backoff(1), Duration::from_secs(2));
+        assert_eq!(backoff(2), Duration::from_secs(4));
+        // Capped so a long retry chain does not sleep for hours.
+        assert_eq!(backoff(20), Duration::from_secs(64));
+    }
 }
 
 #[cfg(test)]

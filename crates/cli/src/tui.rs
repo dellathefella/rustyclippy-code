@@ -5,7 +5,7 @@
 //! [`FeedEntry`] rows into a [`UiFeed`]; this module owns the terminal and
 //! redraws whenever the feed revision changes.
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,6 +75,8 @@ pub struct Tui {
     /// Set when Shift+Tab asked for a mode switch; the caller drains it.
     toggle_mode: bool,
     quit: bool,
+    /// True once the terminal has been restored, so `Drop` does not repeat it.
+    restored: bool,
 }
 
 impl Tui {
@@ -100,11 +102,16 @@ impl Tui {
             history,
             toggle_mode: false,
             quit: false,
+            restored: false,
         })
     }
 
     /// Restore the terminal. Safe to call twice.
     pub fn leave(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
         disable_raw_mode().ok();
         execute!(
             self.terminal.backend_mut(),
@@ -496,6 +503,29 @@ impl Tui {
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+/// Restore the terminal from anywhere, without a `Tui` handle.
+///
+/// Used by the panic hook and the error path in `main`, where the `Tui` may
+/// already be gone or never constructed. Safe to call when the terminal was
+/// never taken over: the escape sequences are harmless no-ops.
+pub fn restore_terminal() {
+    disable_raw_mode().ok();
+    let mut stdout = io::stdout();
+    execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen).ok();
+    let _ = stdout.flush();
+}
+
+impl Drop for Tui {
+    /// Restore the terminal even when the session ends with an error or panic.
+    ///
+    /// Without this, an error inside the chat loop leaves the terminal in raw
+    /// mode on the alternate screen, and the user's shell stays unusable until
+    /// they run `reset`.
+    fn drop(&mut self) {
+        let _ = self.leave();
     }
 }
 

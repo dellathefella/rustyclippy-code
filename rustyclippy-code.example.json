@@ -10,11 +10,11 @@
     "cache_prompt": true,
     "include_reasoning_in_history": false,
     "reasoning_effort": "high",
-    "timeout_secs": 600
+    "timeout_secs": 600,
+    "max_retries": 3
   },
   "agent": {
     "mode": "build",
-    "max_steps": 60,
     "max_depth": 3
   },
   "cache": {

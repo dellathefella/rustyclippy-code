@@ -81,6 +81,8 @@ pub struct ProviderConfig {
     /// parameter. Matches the DSH harness's `reasoningEffort` knob.
     pub reasoning_effort: Option<String>,
     pub timeout_secs: u64,
+    /// Retries for transient provider failures (429/5xx). `0` disables retry.
+    pub max_retries: u32,
 }
 
 impl Default for ProviderConfig {
@@ -100,6 +102,7 @@ impl Default for ProviderConfig {
             include_reasoning_in_history: false,
             reasoning_effort: Some("high".to_string()),
             timeout_secs: 600,
+            max_retries: 3,
         }
     }
 }
@@ -119,6 +122,7 @@ impl ProviderConfig {
             include_reasoning_in_history: false,
             reasoning_effort: None,
             timeout_secs: 300,
+            max_retries: 3,
         }
     }
 
@@ -151,6 +155,33 @@ impl ProviderConfig {
         std::env::var(&self.api_key_env)
             .ok()
             .filter(|value| !value.trim().is_empty())
+    }
+}
+
+/// Write `text` to `path`, restricting the file to the owner on Unix.
+///
+/// A config can carry an API key, so it must not be world-readable. The file is
+/// created with mode 0600 rather than written then chmodded, so there is no
+/// window where it is readable by other users.
+fn write_private(path: &Path, text: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, text)?;
+        Ok(())
     }
 }
 
@@ -192,7 +223,6 @@ impl AgentMode {
 #[serde(default)]
 pub struct AgentConfig {
     pub mode: AgentMode,
-    pub max_steps: usize,
     /// Maximum subagent recursion depth for the `task` tool.
     pub max_depth: usize,
 }
@@ -201,7 +231,6 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             mode: AgentMode::Build,
-            max_steps: 60,
             max_depth: 3,
         }
     }
@@ -490,7 +519,7 @@ impl Config {
             }
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text).with_context(|| format!("writing config {}", path.display()))?;
+        write_private(path, &text).with_context(|| format!("writing config {}", path.display()))?;
         Ok(())
     }
 
@@ -597,6 +626,17 @@ mod tests {
         );
         assert_eq!(config.cache.autocompact_at_tokens, 234_464);
         config.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        Config::default().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "config must not be world-readable");
     }
 
     #[test]

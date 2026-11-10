@@ -104,6 +104,12 @@ your way:
   Anything with a redirection, a pipe into an unknown binary, a command
   substitution, or a mutating subcommand (`git commit`, `sed -i`,
   `find -delete`) still asks.
+- **Argument-executing binaries always prompt.** `env`, `xargs`, `sudo`, `sh`,
+  `bash` and `eval` run whatever they are given, so they are never treated as
+  read-only — `env rm -rf /` would otherwise run unapproved.
+- **Positional git arguments prompt.** `git tag v1` and `git branch new` create
+  refs without a mutating flag, and `git log --output=FILE` writes a file, so
+  both ask.
 - **One prompt per batch.** When the model requests several tools in a single
   step, you get one question listing all of them instead of one question per
   call.
@@ -154,7 +160,7 @@ rustyclippy-code setup [--yes] [--force] [--path <file>]   interactive setup wiz
 rustyclippy-code doctor                                    check endpoint and effective config
 rustyclippy-code chat [--session <id>] [--continue] [--mode build|plan] interactive REPL
 rustyclippy-code tui [--session <id>] [--continue] [--mode build|plan]  full-screen TUI
-rustyclippy-code run <prompt> [--image <path>]... [--session <id>] [--continue] [--json] [--yes] [--max-steps N]
+rustyclippy-code run <prompt> [--image <path>]... [--session <id>] [--continue] [--json] [--yes]
 rustyclippy-code stats [--project <path>] [--json]         lifetime token usage for a project
 rustyclippy-code sessions list|show <id>|delete <id>
 rustyclippy-code cache report [--session <id>] [--json]
@@ -297,6 +303,16 @@ overrides: `RUSTYCLIPPY_BASE_URL`, `RUSTYCLIPPY_MODEL`, `RUSTYCLIPPY_PROVIDER`,
 `RUSTYCLIPPY_MODE`, `RUSTYCLIPPY_HOME`.
 
 See [`rustyclippy-code.example.json`](rustyclippy-code.example.json) for every field.
+
+Notes on a few settings:
+
+- `provider.max_retries` (default 3) retries transient provider failures —
+  HTTP 429 and 5xx — with exponential backoff, honoring `Retry-After`. A 4xx is
+  never retried, since retrying cannot fix a bad request.
+- There is no agent step ceiling. A turn runs until the model stops asking for
+  tools; it is bounded by the interrupt key, the context budget (which forces
+  compaction) and the provider's own limits.
+- The config file is written with mode `0600`, since it can carry an API key.
 
 ## Architecture
 

@@ -1,5 +1,7 @@
 //! Web tools: `websearch` (DuckDuckGo / Brave / Tavily / SearXNG) and `webfetch`.
 
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -122,6 +124,10 @@ impl Tool for WebFetchTool {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             bail!("url must start with http:// or https://");
         }
+        // Refuse loopback, link-local and private addresses. Without this the
+        // model could read cloud metadata (169.254.169.254) or probe the local
+        // inference server through the fetch tool.
+        guard_url(url)?;
         let max_chars = args
             .get("max_chars")
             .and_then(|value| value.as_u64())
@@ -157,6 +163,70 @@ impl Tool for WebFetchTool {
     }
 }
 
+/// Reject URLs that point at loopback, link-local, or private addresses.
+///
+/// The fetch tool is reachable by the model, so without this guard a prompt
+/// could read cloud metadata (`169.254.169.254`), probe the local inference
+/// server, or scan the LAN. Hostnames are resolved first so a DNS name that
+/// maps to a private address is caught too.
+fn guard_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("parsing url `{url}`"))?;
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("url `{url}` has no host"))?;
+
+    // A literal IP is checked directly; a name is resolved and every address
+    // must pass, so a DNS rebind cannot slip through.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            bail!("refusing to fetch `{url}`: {ip} is a private or loopback address");
+        }
+        return Ok(());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addresses = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .with_context(|| format!("resolving host `{host}`"))?;
+    for address in addresses {
+        if is_blocked_ip(address.ip()) {
+            bail!(
+                "refusing to fetch `{url}`: `{host}` resolves to {} (private or loopback)",
+                address.ip()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// True for addresses a fetch tool must never reach.
+fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_v4(v4),
+        IpAddr::V6(v6) => {
+            // IPv4-mapped addresses (`::ffff:127.0.0.1`) must be checked as v4.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_v4(v4);
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
+    }
+}
+
+fn is_blocked_v4(ip: Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local() // 169.254.0.0/16, cloud metadata
+        || ip.is_broadcast()
+        || ip.is_unspecified()
+        // 0.0.0.0/8 "this network"
+        || ip.octets()[0] == 0
+        // 100.64.0.0/10 carrier-grade NAT
+        || (ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+}
+
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -185,10 +255,17 @@ async fn duckduckgo(query: &str, max_results: usize) -> Result<Vec<SearchResult>
 }
 
 fn parse_duckduckgo(html: &str, max_results: usize) -> Vec<SearchResult> {
-    let anchor_re = Regex::new(r#"(?s)<a([^>]*class="result__a"[^>]*)>(.*?)</a>"#).unwrap();
-    let href_re = Regex::new(r#"href="([^"]+)""#).unwrap();
-    let snippet_re =
-        Regex::new(r#"(?s)<(?:a|div)[^>]*class="result__snippet"[^>]*>(.*?)</(?:a|div)>"#).unwrap();
+    // Compiled once: these run on every search, and regex compilation is far
+    // more expensive than matching.
+    static ANCHOR_RE: OnceLock<Regex> = OnceLock::new();
+    static HREF_RE: OnceLock<Regex> = OnceLock::new();
+    static SNIPPET_RE: OnceLock<Regex> = OnceLock::new();
+    let anchor_re = ANCHOR_RE
+        .get_or_init(|| Regex::new(r#"(?s)<a([^>]*class="result__a"[^>]*)>(.*?)</a>"#).unwrap());
+    let href_re = HREF_RE.get_or_init(|| Regex::new(r#"href="([^"]+)""#).unwrap());
+    let snippet_re = SNIPPET_RE.get_or_init(|| {
+        Regex::new(r#"(?s)<(?:a|div)[^>]*class="result__snippet"[^>]*>(.*?)</(?:a|div)>"#).unwrap()
+    });
 
     let mut titles: Vec<(String, String)> = Vec::new();
     for capture in anchor_re.captures_iter(html) {
@@ -370,7 +447,8 @@ fn clean_text(html: &str) -> String {
 }
 
 fn strip_html(html: &str) -> String {
-    let tag_re = Regex::new(r"(?s)<[^>]+>").unwrap();
+    static TAG_RE: OnceLock<Regex> = OnceLock::new();
+    let tag_re = TAG_RE.get_or_init(|| Regex::new(r"(?s)<[^>]+>").unwrap());
     tag_re.replace_all(html, " ").into_owned()
 }
 
@@ -444,6 +522,44 @@ mod tests {
     fn html_is_stripped_and_entities_decoded() {
         let text = clean_text("<p>Hello &amp; <b>world</b></p>");
         assert_eq!(text, "Hello & world");
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_private_and_loopback_targets() {
+        for url in [
+            "http://127.0.0.1:11234/v1",
+            "http://localhost/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.4.108:11234/v1",
+            "http://192.168.1.1/",
+            "http://172.16.0.1/",
+            "http://[::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://0.0.0.0/",
+            "http://100.64.0.1/",
+        ] {
+            assert!(guard_url(url).is_err(), "{url} should be blocked");
+        }
+    }
+
+    #[test]
+    fn ssrf_guard_allows_public_hosts() {
+        // Literal public IPs need no DNS, so these stay offline-safe.
+        for url in ["https://8.8.8.8/", "http://93.184.216.34/"] {
+            assert!(guard_url(url).is_ok(), "{url} should be allowed");
+        }
+    }
+
+    #[test]
+    fn blocked_ip_classification() {
+        assert!(is_blocked_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_blocked_ip("10.0.0.1".parse().unwrap()));
+        assert!(is_blocked_ip("::1".parse().unwrap()));
+        assert!(is_blocked_ip("fe80::1".parse().unwrap()));
+        assert!(is_blocked_ip("fc00::1".parse().unwrap()));
+        assert!(!is_blocked_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_blocked_ip("2606:4700::1111".parse().unwrap()));
     }
 
     #[test]
