@@ -272,6 +272,31 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Most recent session recorded for a project directory.
+    ///
+    /// Paths are canonicalized before comparison so `--continue` works from a
+    /// symlinked or relative path. Returns `None` when the directory has no
+    /// sessions yet.
+    pub fn latest_for_cwd(&self, cwd: &Path) -> Result<Option<SessionSummary>> {
+        let target = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let mut best: Option<SessionSummary> = None;
+        for summary in self.list()? {
+            let recorded = PathBuf::from(&summary.cwd);
+            let recorded = fs::canonicalize(&recorded).unwrap_or(recorded);
+            if recorded != target {
+                continue;
+            }
+            if best
+                .as_ref()
+                .map(|current| summary.created_at > current.created_at)
+                .unwrap_or(true)
+            {
+                best = Some(summary);
+            }
+        }
+        Ok(best)
+    }
+
     /// Replay a session into a transcript + metadata.
     pub fn replay(&self, id: &str) -> Result<(SessionMeta, Vec<SessionEvent>)> {
         let events = self.load(id)?;
@@ -333,5 +358,37 @@ mod tests {
         store.create(meta("b")).unwrap();
         let list = store.list().unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    fn meta_in(id: &str, cwd: &str, created_at: DateTime<Utc>) -> SessionMeta {
+        SessionMeta {
+            cwd: cwd.to_string(),
+            created_at,
+            ..meta(id)
+        }
+    }
+
+    #[test]
+    fn latest_for_cwd_picks_the_newest_session() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        let cwd = project.path().to_string_lossy().to_string();
+
+        let older = Utc::now() - chrono::Duration::hours(2);
+        store.create(meta_in("old", &cwd, older)).unwrap();
+        store.create(meta_in("new", &cwd, Utc::now())).unwrap();
+        store.create(meta_in("other", "/somewhere/else", Utc::now())).unwrap();
+
+        let latest = store.latest_for_cwd(project.path()).unwrap().unwrap();
+        assert_eq!(latest.id, "new");
+    }
+
+    #[test]
+    fn latest_for_cwd_is_none_without_sessions() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let project = TempDir::new().unwrap();
+        assert!(store.latest_for_cwd(project.path()).unwrap().is_none());
     }
 }

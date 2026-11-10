@@ -23,6 +23,7 @@ pub async fn run(
     config: Config,
     prompt: String,
     session: Option<String>,
+    continue_session: bool,
     mode: Option<String>,
     yes: bool,
     json: bool,
@@ -46,6 +47,7 @@ pub async fn run(
         attachments.push(images::read_image(path)?);
     }
 
+    let session = resolve_session(session, continue_session, &cwd)?;
     let mut agent = match session {
         Some(id) => Agent::resume(config, id, output.clone(), yes, Some(runner))?,
         None => Agent::new_session(config, cwd, output.clone(), yes, Some(runner))?,
@@ -79,6 +81,7 @@ pub async fn run(
 pub async fn chat(
     config: Config,
     session: Option<String>,
+    continue_session: bool,
     mode: Option<String>,
     yes: bool,
 ) -> Result<()> {
@@ -91,6 +94,7 @@ pub async fn chat(
     let runner: Arc<dyn SubagentRunner> =
         Arc::new(CliSubagentRunner::new(config.clone(), cwd.clone(), yes));
 
+    let session = resolve_session(session, continue_session, &cwd)?;
     let mut agent = match session {
         Some(id) => Agent::resume(
             config.clone(),
@@ -161,6 +165,31 @@ struct ChatContext<'a> {
     cwd: &'a Path,
     yes: bool,
     runner: &'a Arc<dyn SubagentRunner>,
+}
+
+/// Resolve which session to resume.
+///
+/// `--session <id>` wins outright. `--continue` looks up the newest session
+/// recorded for the current directory and errors clearly when there is none.
+fn resolve_session(
+    session: Option<String>,
+    continue_session: bool,
+    cwd: &Path,
+) -> Result<Option<String>> {
+    if let Some(id) = session {
+        return Ok(Some(id));
+    }
+    if !continue_session {
+        return Ok(None);
+    }
+    let store = SessionStore::default_store();
+    match store.latest_for_cwd(cwd)? {
+        Some(summary) => Ok(Some(summary.id)),
+        None => bail!(
+            "no session recorded for {} yet; run without --continue to start one",
+            cwd.display()
+        ),
+    }
 }
 
 enum CommandOutcome {
@@ -783,4 +812,21 @@ fn require_terminal() -> Result<()> {
         bail!("this command needs an interactive terminal");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_session_wins_over_continue() {
+        let resolved = resolve_session(Some("abc".into()), true, Path::new("/tmp")).unwrap();
+        assert_eq!(resolved.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn no_flags_means_a_fresh_session() {
+        let resolved = resolve_session(None, false, Path::new("/tmp")).unwrap();
+        assert!(resolved.is_none());
+    }
 }

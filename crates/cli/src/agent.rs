@@ -1,6 +1,7 @@
 //! The agent loop: plan → guard → stream → tools → repeat, with prefix-anchored
 //! autocompaction and parallel tool execution.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use rustyclippy_llm::{build_provider, LlmRequest, Provider, StreamEvent, Usage};
 use rustyclippy_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
 use serde_json::Value;
 
-use crate::ui::{fmt_num, Output};
+use crate::ui::{fmt_num, truncate, Output};
 
 #[derive(Default)]
 struct PendingCall {
@@ -98,6 +99,128 @@ pub struct Agent {
     pub system: String,
     pub output: Output,
     pub auto_approve: bool,
+    /// Paths the user already approved this session, so repeated edits to the
+    /// same file do not re-prompt.
+    approved_paths: HashSet<PathBuf>,
+    /// Shell commands approved this session.
+    approved_commands: HashSet<String>,
+}
+
+/// What the user chose at a permission prompt.
+enum BatchDecision {
+    AllowAll,
+    AllowSession,
+    DenyAll,
+    PerCall,
+}
+
+enum Answer {
+    Yes,
+    No,
+    Session,
+    Select,
+}
+
+/// Read one answer from stdin. Enter alone means yes, so approving a batch is a
+/// single keystroke.
+fn read_answer() -> Answer {
+    parse_answer(&mut std::io::stdin().lock())
+}
+
+fn parse_answer<R: std::io::BufRead>(reader: &mut R) -> Answer {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap_or(0);
+    match line.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => Answer::Yes,
+        "a" | "all" => Answer::Session,
+        "s" | "select" => Answer::Select,
+        _ => Answer::No,
+    }
+}
+
+fn describe(call: &ToolCall) -> String {
+    describe_args(&call.name, &call.arguments)
+}
+
+/// Commands that only inspect the workspace. Anything else prompts.
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "fd", "tree", "file", "stat", "du",
+    "pwd", "echo", "which", "type", "env", "printenv", "date", "uname", "whoami", "basename",
+    "dirname", "realpath", "readlink", "diff", "sort", "uniq", "cut", "tr", "sed", "awk", "jq",
+    "git", "true", "false", "test",
+];
+
+/// Subcommands that mutate even though the binary is read-only.
+const MUTATING_SUBCOMMANDS: &[&str] = &[
+    "commit", "push", "pull", "merge", "rebase", "reset", "checkout", "switch", "clean", "rm",
+    "mv", "add", "stash", "tag", "init", "clone", "install", "publish", "run", "build", "test",
+    "fix", "fmt", "update", "remove", "delete", "apply", "restore", "cherry-pick", "revert",
+];
+
+/// True when a shell command only reads. Conservative: any redirection, any
+/// unknown binary, or any mutating subcommand counts as a mutation.
+fn is_read_only_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Redirection, backgrounding, or command substitution can write.
+    if trimmed.contains('>')
+        || trimmed.contains('<')
+        || trimmed.contains('`')
+        || trimmed.contains("$(")
+        || trimmed.contains('&')
+    {
+        return false;
+    }
+    for segment in trimmed.split(['|', ';', '\n']) {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let mut words = segment.split_whitespace();
+        let Some(binary) = words.next() else {
+            continue;
+        };
+        // Strip a leading path so `/bin/ls` is recognized.
+        let binary = binary.rsplit('/').next().unwrap_or(binary);
+        if !READ_ONLY_COMMANDS.contains(&binary) {
+            return false;
+        }
+        // `sed -i`, `find -delete`, `git commit`, `cargo build` all write.
+        for word in words {
+            let word = word.trim_start_matches('-');
+            if MUTATING_SUBCOMMANDS.contains(&word) {
+                return false;
+            }
+            if word == "i" || word == "delete" || word == "exec" || word == "execdir" {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn describe_args(name: &str, args: &Value) -> String {
+    let detail = match name {
+        "bash" | "loop" => args
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "edit" | "write" => args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "task" => args
+            .get("description")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    };
+    truncate(&detail, 120)
 }
 
 impl Agent {
@@ -160,6 +283,8 @@ impl Agent {
             system,
             output,
             auto_approve,
+            approved_paths: HashSet::new(),
+            approved_commands: HashSet::new(),
         })
     }
 
@@ -247,6 +372,8 @@ impl Agent {
             system,
             output,
             auto_approve,
+            approved_paths: HashSet::new(),
+            approved_commands: HashSet::new(),
         })
     }
 
@@ -455,10 +582,7 @@ impl Agent {
             // Permission checks are sequential (they may prompt on stdin);
             // execution is parallel. Results are appended in call order so the
             // transcript stays deterministic and the cached prefix is stable.
-            let approvals: Vec<Result<(), String>> = tool_calls
-                .iter()
-                .map(|call| self.check_permission(call))
-                .collect();
+            let approvals = self.check_permissions(&tool_calls);
             for (call, approval) in tool_calls.iter().zip(&approvals) {
                 match approval {
                     Ok(()) => self.output.tool_call(&call.name, &call.arguments),
@@ -525,7 +649,55 @@ impl Agent {
         }
     }
 
-    fn check_permission(&self, call: &ToolCall) -> Result<(), String> {
+    fn check_permissions(&mut self, calls: &[ToolCall]) -> Vec<Result<(), String>> {
+        let mut approvals: Vec<Option<Result<(), String>>> = Vec::with_capacity(calls.len());
+        let mut pending: Vec<usize> = Vec::new();
+
+        for (index, call) in calls.iter().enumerate() {
+            match self.precheck(call) {
+                Ok(true) => approvals.push(Some(Ok(()))),
+                Ok(false) => {
+                    approvals.push(None);
+                    pending.push(index);
+                }
+                Err(reason) => approvals.push(Some(Err(reason))),
+            }
+        }
+
+        if pending.is_empty() {
+            return approvals.into_iter().map(|value| value.unwrap()).collect();
+        }
+
+        // One prompt for the whole batch instead of one per tool call.
+        let decision = self.ask_batch(&pending.iter().map(|&i| &calls[i]).collect::<Vec<_>>());
+        for index in pending {
+            let call = &calls[index];
+            let outcome = match decision {
+                BatchDecision::AllowAll => Ok(()),
+                BatchDecision::AllowSession => {
+                    self.auto_approve = true;
+                    Ok(())
+                }
+                BatchDecision::DenyAll => Err(format!("`{}` denied by the user", call.name)),
+                BatchDecision::PerCall => {
+                    if self.ask(&call.name, &call.arguments) {
+                        Ok(())
+                    } else {
+                        Err(format!("`{}` denied by the user", call.name))
+                    }
+                }
+            };
+            if outcome.is_ok() {
+                self.remember_grant(call);
+            }
+            approvals[index] = Some(outcome);
+        }
+
+        approvals.into_iter().map(|value| value.unwrap()).collect()
+    }
+
+    /// `Ok(true)` = allowed without asking, `Ok(false)` = needs a prompt.
+    fn precheck(&self, call: &ToolCall) -> Result<bool, String> {
         let Some(tool) = self.registry.get(&call.name) else {
             return Err(format!("unknown tool `{}`", call.name));
         };
@@ -539,47 +711,102 @@ impl Agent {
             ));
         }
         if !tool.mutates() {
-            return Ok(());
+            return Ok(true);
+        }
+        // Read-only shell inspection (`ls`, `cat`, `grep`, `git status`) never
+        // needs approval; prompting for each one makes a turn unusable.
+        if matches!(call.name.as_str(), "bash" | "loop") {
+            if let Some(command) = call.arguments.get("command").and_then(|value| value.as_str()) {
+                if is_read_only_command(command) {
+                    return Ok(true);
+                }
+            }
         }
         match self.permission_for(&call.name) {
-            PermissionMode::Auto => Ok(()),
+            PermissionMode::Auto => Ok(true),
             PermissionMode::Readonly => Err(format!(
                 "`{}` denied by the readonly permission policy",
                 call.name
             )),
             PermissionMode::Ask => {
-                if self.auto_approve || self.ask(&call.name, &call.arguments) {
-                    Ok(())
+                if self.auto_approve || self.already_granted(call) {
+                    Ok(true)
                 } else {
-                    Err(format!("`{}` denied by the user", call.name))
+                    Ok(false)
                 }
             }
         }
     }
 
-    fn ask(&self, name: &str, args: &Value) -> bool {
-        let detail = match name {
-            "bash" | "loop" => args
-                .get("command")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string(),
-            "edit" | "write" => args
+    /// A path or command the user approved earlier this session.
+    fn already_granted(&self, call: &ToolCall) -> bool {
+        match call.name.as_str() {
+            "edit" | "write" => call
+                .arguments
                 .get("path")
                 .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string(),
-            "task" => args
-                .get("description")
+                .map(|path| self.approved_paths.contains(&self.tool_ctx.resolve(path)))
+                .unwrap_or(false),
+            "bash" | "loop" => call
+                .arguments
+                .get("command")
                 .and_then(|value| value.as_str())
-                .unwrap_or("")
-                .to_string(),
-            _ => String::new(),
-        };
-        eprintln!("allow {} {}? [y/N] ", name, detail);
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).unwrap_or(0);
-        matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+                .map(|command| self.approved_commands.contains(command))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+
+    fn remember_grant(&mut self, call: &ToolCall) {
+        match call.name.as_str() {
+            "edit" | "write" => {
+                if let Some(path) = call.arguments.get("path").and_then(|value| value.as_str()) {
+                    self.approved_paths.insert(self.tool_ctx.resolve(path));
+                }
+            }
+            "bash" | "loop" => {
+                if let Some(command) = call
+                    .arguments
+                    .get("command")
+                    .and_then(|value| value.as_str())
+                {
+                    self.approved_commands.insert(command.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn ask_batch(&self, calls: &[&ToolCall]) -> BatchDecision {
+        if calls.len() == 1 {
+            let call = calls[0];
+            let detail = describe(call);
+            eprint!("allow {} {}? [Y/n/a] ", call.name, detail);
+            return match read_answer() {
+                Answer::Yes => BatchDecision::AllowAll,
+                Answer::No => BatchDecision::DenyAll,
+                Answer::Session => BatchDecision::AllowSession,
+                Answer::Select => BatchDecision::PerCall,
+            };
+        }
+
+        eprintln!("{} tools need approval:", calls.len());
+        for (index, call) in calls.iter().enumerate() {
+            eprintln!("  {}. {} {}", index + 1, call.name, describe(call));
+        }
+        eprint!("allow all {}? [Y/n/a/s] (a = allow for this session, s = choose each) ", calls.len());
+        match read_answer() {
+            Answer::Yes => BatchDecision::AllowAll,
+            Answer::No => BatchDecision::DenyAll,
+            Answer::Session => BatchDecision::AllowSession,
+            Answer::Select => BatchDecision::PerCall,
+        }
+    }
+
+    fn ask(&self, name: &str, args: &Value) -> bool {
+        let detail = describe_args(name, args);
+        eprint!("allow {} {}? [Y/n/a] ", name, detail);
+        matches!(read_answer(), Answer::Yes | Answer::Session)
     }
 
     async fn execute_tool(&self, call: &ToolCall) -> ToolResult {
@@ -664,6 +891,83 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn edit_call(path: &str) -> ToolCall {
+        ToolCall::new("c1", "edit", serde_json::json!({ "path": path }))
+    }
+
+    #[test]
+    fn describe_shows_the_path_for_edits() {
+        assert_eq!(describe(&edit_call("src/main.rs")), "src/main.rs");
+    }
+
+    #[test]
+    fn describe_shows_the_command_for_bash() {
+        let call = ToolCall::new("c1", "bash", serde_json::json!({ "command": "ls -la" }));
+        assert_eq!(describe(&call), "ls -la");
+    }
+
+    #[test]
+    fn describe_truncates_long_details() {
+        let long = "x".repeat(400);
+        let call = ToolCall::new("c1", "bash", serde_json::json!({ "command": long }));
+        assert!(describe(&call).chars().count() <= 121);
+    }
+
+    #[test]
+    fn read_only_commands_do_not_prompt() {
+        for command in [
+            "ls -la",
+            "cat src/main.rs",
+            "grep -rn foo crates/",
+            "git status",
+            "git log --oneline",
+            "git diff HEAD",
+            "find . -name '*.rs'",
+            "head -20 README.md | wc -l",
+            "/bin/ls",
+        ] {
+            assert!(is_read_only_command(command), "{command} should be read-only");
+        }
+    }
+
+    #[test]
+    fn mutating_commands_still_prompt() {
+        for command in [
+            "rm -rf target",
+            "echo hi > file.txt",
+            "git commit -m x",
+            "cargo build",
+            "sed -i 's/a/b/' file.rs",
+            "find . -delete",
+            "npm install",
+            "cargo check",
+            "node script.js",
+            "curl http://example.com",
+            "ls && rm x",
+            "cat $(echo secret)",
+        ] {
+            assert!(!is_read_only_command(command), "{command} should prompt");
+        }
+    }
+
+    #[test]
+    fn enter_alone_approves() {
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+        assert!(matches!(parse_answer(&mut input), Answer::Yes));
+    }
+
+    #[test]
+    fn a_grants_the_session() {
+        let mut input = std::io::Cursor::new(b"a\n".to_vec());
+        assert!(matches!(parse_answer(&mut input), Answer::Session));
+    }
+
+    #[test]
+    fn n_denies() {
+        let mut input = std::io::Cursor::new(b"n\n".to_vec());
+        assert!(matches!(parse_answer(&mut input), Answer::No));
+    }
 
     #[test]
     fn assembler_joins_fragments() {

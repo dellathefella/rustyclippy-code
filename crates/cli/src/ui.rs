@@ -6,6 +6,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rustyclippy_core::{CompactionRecord, RequestPlan};
 use rustyclippy_llm::Usage;
@@ -19,6 +20,70 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const BOLD: &str = "\x1b[1m";
 
+/// One transcript row produced by the agent, consumed by the TUI renderer.
+#[derive(Debug, Clone)]
+pub enum FeedEntry {
+    /// A prompt typed by the user.
+    User(String),
+    /// Assistant text, streamed in chunks.
+    Text(String),
+    /// A tool invocation line.
+    ToolCall { name: String, detail: String },
+    /// A tool result line.
+    ToolResult {
+        name: String,
+        ok: bool,
+        detail: String,
+    },
+    /// Per-request cache accounting.
+    Metrics(String),
+    /// Compaction progress.
+    Compaction(String),
+    /// Warning / error chrome.
+    Notice { level: NoticeLevel, text: String },
+    /// Turn footer.
+    TurnSummary(String),
+    /// Mode switch announcement.
+    ModeSwitch(String),
+    /// Image attachment announcement.
+    Image(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Hint,
+    Warning,
+    Error,
+}
+
+/// Shared transcript buffer the agent writes into and the TUI reads.
+#[derive(Debug, Default)]
+pub struct UiFeed {
+    entries: Vec<FeedEntry>,
+    /// Bumped on every push so the renderer knows to redraw.
+    revision: u64,
+}
+
+impl UiFeed {
+    pub fn push(&mut self, entry: FeedEntry) {
+        self.entries.push(entry);
+        self.revision += 1;
+    }
+
+    pub fn entries(&self) -> &[FeedEntry] {
+        &self.entries
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.revision += 1;
+    }
+}
+
 #[derive(Debug)]
 pub struct Output {
     pub json: bool,
@@ -28,6 +93,8 @@ pub struct Output {
     interactive: bool,
     /// True when the next printed character starts a fresh output line.
     at_line_start: AtomicBool,
+    /// When set, output is collected for a TUI instead of printed.
+    feed: Option<Arc<Mutex<UiFeed>>>,
 }
 
 impl Clone for Output {
@@ -38,6 +105,7 @@ impl Clone for Output {
             color: self.color,
             interactive: self.interactive,
             at_line_start: AtomicBool::new(self.at_line_start.load(Ordering::Relaxed)),
+            feed: self.feed.clone(),
         }
     }
 }
@@ -53,6 +121,7 @@ impl Output {
             color,
             interactive: false,
             at_line_start: AtomicBool::new(true),
+            feed: None,
         }
     }
 
@@ -65,6 +134,19 @@ impl Output {
             color,
             interactive: color,
             at_line_start: AtomicBool::new(true),
+            feed: None,
+        }
+    }
+
+    /// Output routed into a TUI transcript instead of the terminal.
+    pub fn tui(feed: Arc<Mutex<UiFeed>>) -> Self {
+        Self {
+            json: false,
+            quiet: false,
+            color: false,
+            interactive: false,
+            at_line_start: AtomicBool::new(true),
+            feed: Some(feed),
         }
     }
 
@@ -76,11 +158,24 @@ impl Output {
             color: false,
             interactive: false,
             at_line_start: AtomicBool::new(true),
+            feed: None,
         }
     }
 
     fn silent(&self) -> bool {
         self.json || self.quiet
+    }
+
+    fn feed(&self) -> Option<&Arc<Mutex<UiFeed>>> {
+        self.feed.as_ref()
+    }
+
+    fn push(&self, entry: FeedEntry) {
+        if let Some(feed) = self.feed() {
+            if let Ok(mut feed) = feed.lock() {
+                feed.push(entry);
+            }
+        }
     }
 
     fn paint(&self, code: &str, text: &str) -> String {
@@ -116,6 +211,10 @@ impl Output {
         if self.silent() {
             return;
         }
+        if self.feed().is_some() {
+            // The TUI draws its own header from live agent state.
+            return;
+        }
         eprintln!(
             "{} {}",
             self.paint(BOLD, "▌ rustyclippy-code"),
@@ -133,6 +232,13 @@ impl Output {
     /// Dim hint line under the header.
     pub fn hint(&self, text: &str) {
         if self.silent() {
+            return;
+        }
+        if self.feed().is_some() {
+            self.push(FeedEntry::Notice {
+                level: NoticeLevel::Hint,
+                text: text.to_string(),
+            });
             return;
         }
         eprintln!("{} {}", self.paint(DIM, "·"), self.paint(DIM, text));
@@ -163,6 +269,10 @@ impl Output {
         if self.silent() {
             return;
         }
+        if self.feed().is_some() {
+            self.push(FeedEntry::Text(chunk.to_string()));
+            return;
+        }
         if !self.interactive {
             print!("{chunk}");
             let _ = std::io::stdout().flush();
@@ -186,6 +296,9 @@ impl Output {
         if self.silent() {
             return;
         }
+        if self.feed().is_some() {
+            return;
+        }
         println!();
         self.at_line_start.store(true, Ordering::Relaxed);
     }
@@ -196,6 +309,13 @@ impl Output {
         }
         let detail = serde_json::to_string(arguments).unwrap_or_default();
         let detail = truncate(&detail, 200);
+        if self.feed().is_some() {
+            self.push(FeedEntry::ToolCall {
+                name: name.to_string(),
+                detail,
+            });
+            return;
+        }
         eprintln!(
             "  {} {} {}",
             self.paint(CYAN, "●"),
@@ -208,16 +328,24 @@ impl Output {
         if self.silent() {
             return;
         }
-        let marker = if result.ok {
-            self.paint(GREEN, "└")
-        } else {
-            self.paint(RED, "└")
-        };
         let first_line = result
             .content
             .lines()
             .find(|line| !line.trim().is_empty())
             .unwrap_or("(no output)");
+        if self.feed().is_some() {
+            self.push(FeedEntry::ToolResult {
+                name: name.to_string(),
+                ok: result.ok,
+                detail: truncate(first_line, 160),
+            });
+            return;
+        }
+        let marker = if result.ok {
+            self.paint(GREEN, "└")
+        } else {
+            self.paint(RED, "└")
+        };
         eprintln!(
             "  {} {} {}",
             marker,
@@ -259,6 +387,20 @@ impl Output {
         } else {
             String::new()
         };
+        let line = format!(
+            "turn {turn} step {step} · prompt={} cached={} ({:.1}%) prefill={} out={}{} · {}",
+            fmt_num(prompt),
+            fmt_num(cached),
+            ratio * 100.0,
+            fmt_num(prefill),
+            fmt_num(usage.completion_tokens),
+            reasoning,
+            status
+        );
+        if self.feed().is_some() {
+            self.push(FeedEntry::Metrics(line));
+            return;
+        }
         eprintln!(
             "  {} {} · prompt={} cached={} ({:.1}%) prefill={} out={}{} · {}",
             self.paint(DIM, "·"),
@@ -277,26 +419,34 @@ impl Output {
         if self.silent() {
             return;
         }
-        eprintln!(
-            "  {} compacting {} messages (~{} tokens) at a cache-aligned boundary",
-            self.paint(YELLOW, "⟳"),
+        let line = format!(
+            "compacting {} messages (~{} tokens) at a cache-aligned boundary",
             dropped,
             fmt_num(before_tokens)
         );
+        if self.feed().is_some() {
+            self.push(FeedEntry::Compaction(line));
+            return;
+        }
+        eprintln!("  {} {}", self.paint(YELLOW, "⟳"), line);
     }
 
     pub fn compaction_done(&self, record: &CompactionRecord, usage: &Usage) {
         if self.silent() {
             return;
         }
-        eprintln!(
-            "  {} compacted {} → {} tokens (summary {} tokens, prefill {} tokens)",
-            self.paint(GREEN, "✓"),
+        let line = format!(
+            "compacted {} → {} tokens (summary {} tokens, prefill {} tokens)",
             fmt_num(record.before_tokens),
             fmt_num(record.after_tokens),
             fmt_num(record.summary_tokens),
             fmt_num(usage.prefill_tokens())
         );
+        if self.feed().is_some() {
+            self.push(FeedEntry::Compaction(line));
+            return;
+        }
+        eprintln!("  {} {}", self.paint(GREEN, "✓"), line);
     }
 
     /// Footer for a finished turn.
@@ -311,20 +461,19 @@ impl Output {
         } else {
             cached as f64 / prompt as f64
         };
-        eprintln!(
-            "{}",
-            self.paint(
-                DIM,
-                &format!(
-                    "── turn {turn} · {steps} steps · prompt={} cached={} ({:.1}%) prefill={} out={} ──",
-                    fmt_num(prompt),
-                    fmt_num(cached),
-                    ratio * 100.0,
-                    fmt_num(usage.prefill_tokens()),
-                    fmt_num(usage.completion_tokens)
-                )
-            )
+        let line = format!(
+            "turn {turn} · {steps} steps · prompt={} cached={} ({:.1}%) prefill={} out={}",
+            fmt_num(prompt),
+            fmt_num(cached),
+            ratio * 100.0,
+            fmt_num(usage.prefill_tokens()),
+            fmt_num(usage.completion_tokens)
         );
+        if self.feed().is_some() {
+            self.push(FeedEntry::TurnSummary(line));
+            return;
+        }
+        eprintln!("{}", self.paint(DIM, &format!("── {line} ──")));
     }
 
     /// Announce an intentional mode switch and its cache consequence.
@@ -332,12 +481,15 @@ impl Output {
         if self.silent() {
             return;
         }
-        eprintln!(
-            "{} mode → {} · system prompt and tool block rebuilt; the cached prefix is cold \
-             (next request re-prefills)",
-            self.paint(YELLOW, "⟳"),
-            self.paint(BOLD, mode)
+        let line = format!(
+            "mode → {mode} · system prompt and tool block rebuilt; the cached prefix is cold \
+             (next request re-prefills)"
         );
+        if self.feed().is_some() {
+            self.push(FeedEntry::ModeSwitch(line));
+            return;
+        }
+        eprintln!("{} {}", self.paint(YELLOW, "⟳"), line);
     }
 
     /// Announce a pending image attachment.
@@ -345,27 +497,38 @@ impl Output {
         if self.silent() {
             return;
         }
-        eprintln!(
-            "{} image attached · {} · {}",
-            self.paint(CYAN, "▌"),
-            mime,
-            fmt_bytes(bytes)
-        );
+        let line = format!("image attached · {mime} · {}", fmt_bytes(bytes));
+        if self.feed().is_some() {
+            self.push(FeedEntry::Image(line));
+            return;
+        }
+        eprintln!("{} {}", self.paint(CYAN, "▌"), line);
     }
 
     pub fn pending_images(&self, count: usize) {
         if self.silent() {
             return;
         }
-        eprintln!(
-            "{} {} image(s) attached — send them with the next prompt",
-            self.paint(DIM, "·"),
-            count
-        );
+        let line = format!("{count} image(s) attached — send them with the next prompt");
+        if self.feed().is_some() {
+            self.push(FeedEntry::Notice {
+                level: NoticeLevel::Hint,
+                text: line,
+            });
+            return;
+        }
+        eprintln!("{} {}", self.paint(DIM, "·"), line);
     }
 
     pub fn warning(&self, message: &str) {
         if self.silent() {
+            return;
+        }
+        if self.feed().is_some() {
+            self.push(FeedEntry::Notice {
+                level: NoticeLevel::Warning,
+                text: message.to_string(),
+            });
             return;
         }
         eprintln!("{} {}", self.paint(YELLOW, "warning:"), message);
@@ -373,6 +536,13 @@ impl Output {
 
     pub fn error(&self, message: &str) {
         if self.silent() {
+            return;
+        }
+        if self.feed().is_some() {
+            self.push(FeedEntry::Notice {
+                level: NoticeLevel::Error,
+                text: message.to_string(),
+            });
             return;
         }
         eprintln!("{} {}", self.paint(RED, "error:"), message);

@@ -91,6 +91,27 @@ Slash commands:
 resets the cached prefix: the next request is cold and re-prefills once. The
 switch is recorded in the session log and replayed on resume.
 
+### Approvals
+
+Mutating tools ask before they run, but the prompt is designed to stay out of
+your way:
+
+- **Read-only shell commands never prompt.** `ls`, `cat`, `grep`, `find`,
+  `git status`, `git diff`, `head`, `wc`, `jq` and friends run immediately.
+  Anything with a redirection, a pipe into an unknown binary, a command
+  substitution, or a mutating subcommand (`git commit`, `sed -i`,
+  `find -delete`) still asks.
+- **One prompt per batch.** When the model requests several tools in a single
+  step, you get one question listing all of them instead of one question per
+  call.
+- **Enter approves.** The prompt is `[Y/n/a]`: Enter or `y` allows, `n` denies,
+  `a` allows everything for the rest of the session.
+- **Grants stick.** Approving an edit to a file (or a specific command) records
+  it, so later edits to the same path do not re-prompt.
+
+Set `permissions.bash`/`edit`/`write`/`task` to `auto` in the config to skip
+prompting entirely, or pass `--yes` on `chat`/`run`.
+
 ### Images
 
 Vision-capable servers accept images attached to a prompt. In the REPL, press
@@ -114,8 +135,8 @@ cached prefix.
 ```text
 rustyclippy-code setup [--yes] [--force] [--path <file>]   interactive setup wizard (alias: init)
 rustyclippy-code doctor                                    check endpoint and effective config
-rustyclippy-code chat [--session <id>] [--mode build|plan] interactive REPL
-rustyclippy-code run <prompt> [--image <path>]... [--session <id>] [--json] [--yes] [--max-steps N]
+rustyclippy-code chat [--session <id>] [--continue] [--mode build|plan] interactive REPL
+rustyclippy-code run <prompt> [--image <path>]... [--session <id>] [--continue] [--json] [--yes] [--max-steps N]
 rustyclippy-code stats [--project <path>] [--json]         lifetime token usage for a project
 rustyclippy-code sessions list|show <id>|delete <id>
 rustyclippy-code cache report [--session <id>] [--json]
@@ -126,6 +147,21 @@ rustyclippy-code config show
 `stats` aggregates every session whose recorded cwd matches the project (the
 current directory by default): sessions, turns, prompt/cached/prefill/output/
 reasoning tokens, cache-hit ratio, and a per-model breakdown.
+
+### Continuing a session
+
+`--continue` resumes the newest session recorded for the current directory, so
+you can pick up where you left off without remembering the session id:
+
+```bash
+rustyclippy-code chat --continue
+rustyclippy-code run --continue "now add the tests"
+```
+
+The lookup canonicalizes paths, so it works from a symlinked or relative
+directory. `--session <id>` takes precedence and the two flags are mutually
+exclusive. If the directory has no sessions yet, `--continue` fails with a clear
+message rather than silently starting a fresh one.
 
 Global overrides: `--config <file>`, `--model <id>`, `--base-url <url>`,
 `--reasoning-effort off|low|high|max`.

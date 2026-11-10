@@ -50,6 +50,9 @@ enum Command {
         /// Resume an existing session
         #[arg(long)]
         session: Option<String>,
+        /// Resume the most recent session recorded for this directory
+        #[arg(long = "continue", conflicts_with = "session")]
+        continue_session: bool,
         /// Agent mode: build or plan
         #[arg(long)]
         mode: Option<String>,
@@ -70,6 +73,9 @@ enum Command {
     Chat {
         #[arg(long)]
         session: Option<String>,
+        /// Resume the most recent session recorded for this directory
+        #[arg(long = "continue", conflicts_with = "session")]
+        continue_session: bool,
         #[arg(long)]
         mode: Option<String>,
         #[arg(long)]
@@ -177,6 +183,7 @@ async fn run() -> Result<()> {
                 Command::Run {
                     prompt,
                     session,
+                    continue_session,
                     mode,
                     yes,
                     json,
@@ -187,11 +194,25 @@ async fn run() -> Result<()> {
                     if text.trim().is_empty() {
                         bail!("`run` needs a prompt");
                     }
-                    commands::run(config, text, session, mode, yes, json, max_steps, images).await
+                    commands::run(
+                        config,
+                        text,
+                        session,
+                        continue_session,
+                        mode,
+                        yes,
+                        json,
+                        max_steps,
+                        images,
+                    )
+                    .await
                 }
-                Command::Chat { session, mode, yes } => {
-                    commands::chat(config, session, mode, yes).await
-                }
+                Command::Chat {
+                    session,
+                    continue_session,
+                    mode,
+                    yes,
+                } => commands::chat(config, session, continue_session, mode, yes).await,
                 Command::Stats { project, json } => commands::stats(project, json),
                 Command::Sessions { action } => match action {
                     SessionsAction::List => commands::sessions_list(),
