@@ -2,6 +2,7 @@
 
 mod agent;
 mod commands;
+mod history;
 mod images;
 mod input;
 mod subagent_runner;

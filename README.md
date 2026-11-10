@@ -115,6 +115,18 @@ your way:
 Set `permissions.bash`/`edit`/`write`/`task` to `auto` in the config to skip
 prompting entirely, or pass `--yes` on `chat`/`run`.
 
+### Prompt history
+
+**Up/Down** recall previous prompts. History is persisted per project directory
+in `~/.rustyclippy-code/history.json`, so prompts survive a restart and stay
+separate between projects. The last 200 entries are kept and consecutive
+duplicates collapse.
+
+In the REPL, Up recalls history whenever you are composing. In the TUI, Up
+recalls history while the input box has text (or while you are already browsing)
+and scrolls the transcript when the box is empty; Down walks forward and
+restores whatever you were typing once you pass the newest entry.
+
 ### Images
 
 Vision-capable servers accept images attached to a prompt. In the REPL, press

@@ -13,6 +13,7 @@ use rustyclippy_core::{
 use rustyclippy_tools::SubagentRunner;
 
 use crate::agent::{Agent, TurnResult};
+use crate::history::History;
 use crate::images;
 use crate::input::{self, InputOutcome};
 use crate::subagent_runner::CliSubagentRunner;
@@ -123,13 +124,14 @@ pub async fn chat(
         runner: &runner,
     };
     let mut pending_images: Vec<ImageAttachment> = Vec::new();
+    let mut history = History::load(&cwd, History::default_path());
 
     loop {
         if !pending_images.is_empty() {
             agent.output.pending_images(pending_images.len());
         }
         let prompt = format!("{} ", agent.output.prompt_marker());
-        let line = match input::read_line(&prompt, &mut pending_images)? {
+        let line = match input::read_line(&prompt, &mut pending_images, &mut history)? {
             InputOutcome::Line(line) => line,
             InputOutcome::Exit => break,
         };
@@ -137,6 +139,9 @@ pub async fn chat(
         if input.is_empty() && pending_images.is_empty() {
             continue;
         }
+        // Record the prompt before dispatch so `/commands` are recallable too.
+        history.push(input);
+        history.save();
 
         if input.starts_with('/') {
             match handle_command(&mut agent, input, &mut pending_images, &context)? {
@@ -192,7 +197,8 @@ pub async fn tui(
         "Ctrl+C quits · /exit /session /cache /stats /new /mode build|plan /thinking /paste /image <path> /clear-images /help",
     );
 
-    let mut tui = crate::tui::Tui::enter(feed.clone())?;
+    let history = History::load(&cwd, History::default_path());
+    let mut tui = crate::tui::Tui::enter(feed.clone(), history)?;
     let result = run_tui_loop(&mut tui, &mut agent, &feed, &cwd, yes, &runner).await;
     tui.leave()?;
     result

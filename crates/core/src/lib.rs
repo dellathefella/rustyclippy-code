@@ -26,6 +26,8 @@ pub use config::{
 };
 pub use image::{base64_decode, base64_encode, detect_mime, ImageAttachment};
 pub use message::{Message, Role, ToolCall};
-pub use session::{CacheTurnRecord, SessionEvent, SessionMeta, SessionStore, SessionSummary};
+pub use session::{
+    default_home, CacheTurnRecord, SessionEvent, SessionMeta, SessionStore, SessionSummary,
+};
 pub use token::{TokenEstimator, DEEPSEEK_CACHE_GRANULARITY};
 pub use transcript::Transcript;

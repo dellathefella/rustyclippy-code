@@ -10,6 +10,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use anyhow::{bail, Context, Result};
 use rustyclippy_core::ImageAttachment;
 
+use crate::history::History;
 use crate::images;
 
 pub enum InputOutcome {
@@ -17,9 +18,14 @@ pub enum InputOutcome {
     Exit,
 }
 
-/// Read one prompt line. Ctrl+V attaches a clipboard image to `pending`.
+/// Read one prompt line. Ctrl+V attaches a clipboard image to `pending`;
+/// Up/Down recall previous prompts from `history`.
 #[cfg(unix)]
-pub fn read_line(prompt: &str, pending: &mut Vec<ImageAttachment>) -> Result<InputOutcome> {
+pub fn read_line(
+    prompt: &str,
+    pending: &mut Vec<ImageAttachment>,
+    history: &mut History,
+) -> Result<InputOutcome> {
     if !io::stdin().is_terminal() {
         return read_line_plain(prompt);
     }
@@ -78,7 +84,14 @@ pub fn read_line(prompt: &str, pending: &mut Vec<ImageAttachment>) -> Result<Inp
                 backspace(&mut buffer, &mut cursor);
                 redraw(prompt, &buffer, cursor);
             }
-            0x1b => handle_escape(&mut stdin, prompt, &mut buffer, &mut cursor, pending)?,
+            0x1b => handle_escape(
+                &mut stdin,
+                prompt,
+                &mut buffer,
+                &mut cursor,
+                pending,
+                history,
+            )?,
             byte if byte >= 0x20 => {
                 let ch = read_char(&mut stdin, byte)?;
                 insert_char(&mut buffer, &mut cursor, ch);
@@ -92,7 +105,11 @@ pub fn read_line(prompt: &str, pending: &mut Vec<ImageAttachment>) -> Result<Inp
 /// Fallback for platforms without termios raw mode: Ctrl+V is unavailable, but
 /// `/paste` and `/image` still work.
 #[cfg(not(unix))]
-pub fn read_line(prompt: &str, _pending: &mut Vec<ImageAttachment>) -> Result<InputOutcome> {
+pub fn read_line(
+    prompt: &str,
+    _pending: &mut Vec<ImageAttachment>,
+    _history: &mut History,
+) -> Result<InputOutcome> {
     read_line_plain(prompt)
 }
 
@@ -354,6 +371,7 @@ fn handle_escape<R: Read>(
     buffer: &mut String,
     cursor: &mut usize,
     pending: &mut Vec<ImageAttachment>,
+    history: &mut History,
 ) -> Result<()> {
     let Some(next) = read_byte(stdin)? else {
         return Ok(());
@@ -374,8 +392,20 @@ fn handle_escape<R: Read>(
     }
 
     match sequence.as_slice() {
-        b"A" => {} // no history yet
-        b"B" => {} // no history yet
+        b"A" => {
+            if let Some(line) = history.previous(buffer) {
+                *buffer = line;
+                *cursor = buffer.len();
+                redraw(prompt, buffer, *cursor);
+            }
+        }
+        b"B" => {
+            if let Some(line) = history.next() {
+                *buffer = line;
+                *cursor = buffer.len();
+                redraw(prompt, buffer, *cursor);
+            }
+        }
         b"C" => {
             if *cursor < buffer.len() {
                 *cursor += buffer[*cursor..]
@@ -475,7 +505,16 @@ mod tests {
         let mut buffer = String::from("prefix ");
         let mut cursor = buffer.len();
         let mut pending = Vec::new();
-        handle_escape(&mut input, "> ", &mut buffer, &mut cursor, &mut pending).unwrap();
+        let mut history = History::default();
+        handle_escape(
+            &mut input,
+            "> ",
+            &mut buffer,
+            &mut cursor,
+            &mut pending,
+            &mut history,
+        )
+        .unwrap();
         assert_eq!(buffer, "prefix hello world");
         assert_eq!(cursor, buffer.len());
         assert!(pending.is_empty());
@@ -487,7 +526,16 @@ mod tests {
         let mut buffer = String::from("ab");
         let mut cursor = buffer.len();
         let mut pending = Vec::new();
-        handle_escape(&mut input, "> ", &mut buffer, &mut cursor, &mut pending).unwrap();
+        let mut history = History::default();
+        handle_escape(
+            &mut input,
+            "> ",
+            &mut buffer,
+            &mut cursor,
+            &mut pending,
+            &mut history,
+        )
+        .unwrap();
         assert_eq!(cursor, 1);
     }
 

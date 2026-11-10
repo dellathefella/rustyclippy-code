@@ -60,12 +60,14 @@ pub struct Tui {
     pending_images: Vec<rustyclippy_core::ImageAttachment>,
     /// Spinner frame, advanced on every draw while a turn is in flight.
     spinner: usize,
+    /// Prompt history for Up/Down recall.
+    history: crate::history::History,
     quit: bool,
 }
 
 impl Tui {
     /// Enter the alternate screen and take over the terminal.
-    pub fn enter(feed: Arc<Mutex<UiFeed>>) -> Result<Self> {
+    pub fn enter(feed: Arc<Mutex<UiFeed>>, history: crate::history::History) -> Result<Self> {
         enable_raw_mode().context("enabling raw terminal mode")?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
@@ -83,6 +85,7 @@ impl Tui {
             submitted: None,
             pending_images: Vec::new(),
             spinner: 0,
+            history,
             quit: false,
         })
     }
@@ -173,6 +176,8 @@ impl Tui {
                 if trimmed.is_empty() {
                     return Ok(None);
                 }
+                self.history.push(&trimmed);
+                self.history.save();
                 self.submitted = Some(trimmed);
                 Ok(Some(TuiOutcome::Prompt))
             }
@@ -252,13 +257,11 @@ impl Tui {
                 Ok(None)
             }
             KeyCode::Up => {
-                self.scroll = self.scroll.saturating_add(1);
-                self.dirty = true;
+                self.recall_previous();
                 Ok(None)
             }
             KeyCode::Down => {
-                self.scroll = self.scroll.saturating_sub(1);
-                self.dirty = true;
+                self.recall_next();
                 Ok(None)
             }
             KeyCode::PageUp => {
@@ -319,6 +322,34 @@ impl Tui {
         std::mem::take(&mut self.pending_images)
     }
 
+    /// Up: recall the previous prompt while composing, otherwise scroll.
+    fn recall_previous(&mut self) {
+        if up_recalls_history(&self.input, self.history.browsing()) {
+            if let Some(line) = self.history.previous(&self.input) {
+                self.input = line;
+                self.cursor = self.input.len();
+                self.dirty = true;
+            }
+        } else {
+            self.scroll = self.scroll.saturating_add(1);
+            self.dirty = true;
+        }
+    }
+
+    /// Down: walk forward through history, restoring the draft at the end.
+    fn recall_next(&mut self) {
+        if self.history.browsing() {
+            if let Some(line) = self.history.next() {
+                self.input = line;
+                self.cursor = self.input.len();
+                self.dirty = true;
+            }
+        } else {
+            self.scroll = self.scroll.saturating_sub(1);
+            self.dirty = true;
+        }
+    }
+
     fn pending_approval(&self) -> bool {
         self.feed
             .lock()
@@ -360,6 +391,12 @@ impl Tui {
         }
         Ok(false)
     }
+}
+
+/// Up recalls history while the user is composing or already browsing; with an
+/// empty input box it scrolls the transcript instead.
+fn up_recalls_history(input: &str, browsing: bool) -> bool {
+    !input.is_empty() || browsing
 }
 
 fn render(
@@ -853,6 +890,13 @@ mod tests {
         assert!(!output.set_show_reasoning(false));
         output.reasoning("more thoughts");
         assert_eq!(feed.lock().unwrap().entries().len(), 1);
+    }
+
+    #[test]
+    fn up_recalls_history_only_while_composing() {
+        assert!(up_recalls_history("typing", false));
+        assert!(up_recalls_history("", true));
+        assert!(!up_recalls_history("", false));
     }
 
     #[test]
