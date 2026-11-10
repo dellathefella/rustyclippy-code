@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Terminal;
 
 use crate::ui::{ApprovalAnswer, FeedEntry, NoticeLevel, UiFeed};
@@ -625,6 +625,11 @@ fn render_queue(frame: &mut ratatui::Frame, area: Rect, queued: &[String]) {
             Span::styled(prompt.clone(), Style::default().fg(MUTED)),
         ]));
     }
+    let width = area.width as usize;
+    let lines: Vec<Line<'_>> = lines
+        .iter()
+        .map(|line| truncate_line(line, width))
+        .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -691,7 +696,15 @@ fn render_header(
         Span::styled("  endpoint ", Style::default().fg(MUTED)),
         Span::styled(header.base_url.clone(), Style::default().fg(MUTED)),
     ]);
-    frame.render_widget(Paragraph::new(Text::from(vec![title, detail, cwd])), inner);
+    // Clip to the pane so a long model id or endpoint cannot bleed past the
+    // border; ratatui would otherwise cut it mid-glyph with no ellipsis.
+    let width = inner.width as usize;
+    let lines = vec![
+        truncate_line(&title, width),
+        truncate_line(&detail, width),
+        truncate_line(&cwd, width),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_transcript(
@@ -711,17 +724,20 @@ fn render_transcript(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = transcript_lines(entries, thinking, spinner, revealed);
+    let lines = wrap_transcript(
+        &transcript_lines(entries, thinking, spinner, revealed),
+        inner.width as usize,
+    );
 
     // A chat transcript grows downward, so pin the view to the newest lines and
-    // let `scroll` walk backwards into history.
-    let total = wrapped_height(&lines, inner.width as usize);
+    // let `scroll` walk backwards into history. Lines are already wrapped, so
+    // the row count here is exactly what the renderer draws.
+    let total = lines.len();
     let visible = inner.height as usize;
     let bottom = total.saturating_sub(visible);
     let offset = bottom.saturating_sub(scroll);
-    let paragraph = Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .scroll((offset.min(u16::MAX as usize) as u16, 0));
+    let paragraph =
+        Paragraph::new(Text::from(lines)).scroll((offset.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, inner);
 }
 
@@ -732,39 +748,191 @@ fn render_transcript(
 /// terminal columns, not chars, so CJK text (two columns per glyph) wraps where
 /// the terminal actually wraps.
 fn wrapped_height(lines: &[Line<'_>], width: usize) -> usize {
+    // A zero-width pane draws nothing, so it has no rows to scroll through.
     if width == 0 {
         return 0;
     }
-    let mut rows = 0usize;
+    wrap_transcript(lines, width).len()
+}
+
+/// Wrap every transcript line to `width` columns.
+///
+/// Wrapping happens here rather than in ratatui so the renderer and the scroll
+/// math agree on the row count, and so continuation rows keep the rail indent
+/// instead of spilling to the pane border.
+fn wrap_transcript(lines: &[Line<'_>], width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
     for line in lines {
-        let text = line.to_string();
-        if text.is_empty() {
-            rows += 1;
-            continue;
+        out.extend(wrap_line(line, width));
+    }
+    out
+}
+
+/// Wrap one line, repeating its leading marker on continuation rows.
+fn wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let owned = Line::from(
+        line.spans
+            .iter()
+            .map(|span| Span::styled(span.content.to_string(), span.style))
+            .collect::<Vec<_>>(),
+    );
+    if width == 0 || display_width(&owned.to_string()) <= width {
+        return vec![owned];
+    }
+
+    // The first span is the rail/bullet marker; the rest is the body.
+    let (prefix, body) = match owned.spans.split_first() {
+        Some((first, rest)) if !rest.is_empty() => (Some(first.clone()), rest.to_vec()),
+        _ => (None, owned.spans.clone()),
+    };
+    let indent = prefix
+        .as_ref()
+        .map(|p| display_width(&p.content))
+        .unwrap_or(0);
+    let avail = width.saturating_sub(indent).max(1);
+
+    // Rails repeat so wrapped text stays inside its column; bullets become
+    // spaces so a wrapped tool line does not sprout a second bullet.
+    let continuation = match &prefix {
+        Some(p) if p.content.starts_with('│') || p.content.starts_with('▌') => p.clone(),
+        Some(_) => Span::raw(" ".repeat(indent)),
+        None => Span::raw(""),
+    };
+
+    wrap_spans(&body, avail)
+        .into_iter()
+        .enumerate()
+        .map(|(index, spans)| {
+            // The first row keeps the original marker; wrapped rows repeat the
+            // rail (or blank out the bullet) so text stays inside its column.
+            let mut all = vec![if index == 0 {
+                prefix.clone().unwrap_or_else(|| Span::raw(""))
+            } else {
+                continuation.clone()
+            }];
+            all.extend(spans);
+            Line::from(all)
+        })
+        .collect()
+}
+
+/// Pack spans into rows of at most `width` columns, breaking on spaces and
+/// splitting words longer than a whole row.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    // Tokenize into alternating word/space runs so styles survive the split.
+    let mut tokens: Vec<(String, Style, bool)> = Vec::new();
+    for span in spans {
+        let mut buf = String::new();
+        let mut space = false;
+        for ch in span.content.chars() {
+            let is_space = ch == ' ';
+            if buf.is_empty() {
+                space = is_space;
+                buf.push(ch);
+            } else if is_space == space {
+                buf.push(ch);
+            } else {
+                tokens.push((std::mem::take(&mut buf), span.style, space));
+                space = is_space;
+                buf.push(ch);
+            }
         }
-        let mut current = 0usize;
-        let mut line_rows = 1usize;
-        for word in text.split(' ') {
-            let word_width = display_width(word);
-            if word_width > width {
-                // Long word: split across as many rows as needed.
-                let extra = word_width.div_ceil(width);
-                line_rows += extra.saturating_sub(1);
-                current = word_width % width;
+        if !buf.is_empty() {
+            tokens.push((buf, span.style, space));
+        }
+    }
+
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut row: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+
+    for (text, style, is_space) in tokens {
+        let w = display_width(&text);
+        if is_space {
+            // Leading spaces on a fresh row would indent the wrap point.
+            if used == 0 {
                 continue;
             }
-            if current == 0 {
-                current = word_width;
-            } else if current + 1 + word_width <= width {
-                current += 1 + word_width;
+            if used + w <= width {
+                row.push(Span::styled(text, style));
+                used += w;
             } else {
-                line_rows += 1;
-                current = word_width;
+                rows.push(std::mem::take(&mut row));
+                used = 0;
             }
+            continue;
         }
-        rows += line_rows;
+        if used + w <= width {
+            row.push(Span::styled(text, style));
+            used += w;
+            continue;
+        }
+        if used > 0 {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if w <= width {
+            row.push(Span::styled(text, style));
+            used = w;
+            continue;
+        }
+        // Word wider than a whole row: split it across rows.
+        let mut buf = String::new();
+        for ch in text.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > width && used > 0 {
+                row.push(Span::styled(std::mem::take(&mut buf), style));
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            buf.push(ch);
+            used += cw;
+        }
+        if !buf.is_empty() {
+            row.push(Span::styled(buf, style));
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
     }
     rows
+}
+
+/// Truncate a line to `width` columns, appending an ellipsis when cut.
+fn truncate_line(line: &Line<'_>, width: usize) -> Line<'static> {
+    if display_width(&line.to_string()) <= width {
+        return Line::from(
+            line.spans
+                .iter()
+                .map(|span| Span::styled(span.content.to_string(), span.style))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let limit = width.saturating_sub(1);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in &line.spans {
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + w > limit {
+                break;
+            }
+            buf.push(ch);
+            used += w;
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, span.style));
+        }
+        if used >= limit {
+            break;
+        }
+    }
+    spans.push(Span::styled("…", Style::default().fg(MUTED)));
+    Line::from(spans)
 }
 
 /// Terminal columns occupied by `text`.
@@ -1086,10 +1254,12 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Tot
         Style::default().fg(MUTED),
     ));
 
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![Line::from(stats), Line::from(gauge)])),
-        area,
-    );
+    let width = area.width as usize;
+    let lines = vec![
+        truncate_line(&Line::from(stats), width),
+        truncate_line(&Line::from(gauge), width),
+    ];
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn short(id: &str) -> String {
@@ -1167,6 +1337,115 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn long_header_fields_are_clipped_with_an_ellipsis() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        feed.lock().unwrap().set_header(crate::ui::HeaderInfo {
+            version: "0.1".into(),
+            model: "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw".into(),
+            mode: "build".into(),
+            session: "20261110-025".into(),
+            cwd: "/Users/jdella/Desktop/AI Coding/deeprust-code".into(),
+            base_url: "http://10.0.4.108:11234/v1".into(),
+        });
+        let rows = render_to_rows(&feed, "", 0);
+        // Every row must fit inside the 80-column frame; a long model id used to
+        // run past the border and get cut mid-glyph.
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(
+                display_width(row),
+                80,
+                "row {index} is not exactly the frame width: {row:?}"
+            );
+        }
+        assert!(
+            rows[2].contains('…'),
+            "clipped model line should end in an ellipsis: {:?}",
+            rows[2]
+        );
+        assert!(
+            rows[2].trim_end().ends_with("│"),
+            "clipped line must still close its border: {:?}",
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn wrapped_transcript_rows_keep_their_rail_indent() {
+        let entries = vec![FeedEntry::Text(
+            "A very long answer line that should wrap across the pane width rather \
+             than being truncated at the right edge of the transcript box."
+                .into(),
+        )];
+        let lines = wrap_transcript(&transcript_lines(&entries, false, 0, usize::MAX), 60);
+        assert!(lines.len() > 1, "fixture must wrap: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.to_string().starts_with("│ "),
+                "every wrapped row keeps the rail: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_tool_rows_do_not_repeat_the_bullet() {
+        let entries = vec![FeedEntry::ToolCall {
+            name: "bash".into(),
+            detail: "cd /Users/jdella/Desktop/AI Coding/deeprust-code && ls && echo \"---\" \
+                     && find crates -name \"*.rs\" | head -50"
+                .into(),
+        }];
+        let lines = wrap_transcript(&transcript_lines(&entries, false, 0, usize::MAX), 60);
+        assert!(lines.len() > 1, "fixture must wrap: {lines:?}");
+        assert!(lines[0].to_string().contains("● bash"));
+        assert!(
+            !lines[1].to_string().contains('●'),
+            "continuation row must not repeat the bullet: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[1].to_string().starts_with("    "),
+            "continuation row aligns under the bullet: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn scroll_math_matches_the_rendered_row_count() {
+        // The renderer and `max_scroll` must agree, or Home overshoots the top
+        // and the transcript jumps past the oldest line.
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        {
+            let mut feed = feed.lock().unwrap();
+            for index in 0..40 {
+                feed.push(FeedEntry::Notice {
+                    level: NoticeLevel::Hint,
+                    text: format!("row {index} padded with plenty of extra words so that it definitely wraps across the pane width and spills onto a second row"),
+                });
+            }
+        }
+        let entries = feed.lock().unwrap().entries().to_vec();
+        let lines = transcript_lines(&entries, false, 0, usize::MAX);
+        let wrapped = wrap_transcript(&lines, 78);
+        assert_eq!(wrapped.len(), wrapped_height(&lines, 78));
+        assert!(wrapped.len() > 40, "fixture must wrap: {}", wrapped.len());
+    }
+
+    #[test]
+    fn narrow_terminal_still_wraps_without_panicking() {
+        // A 20-column pane leaves almost no room after the rail indent; the
+        // wrapper must still produce rows rather than loop or overflow.
+        let entries = vec![FeedEntry::Text("supercalifragilisticexpialidocious".into())];
+        let lines = wrap_transcript(&transcript_lines(&entries, false, 0, usize::MAX), 20);
+        assert!(!lines.is_empty());
+        for line in &lines {
+            assert!(
+                display_width(&line.to_string()) <= 20,
+                "row exceeds the pane width: {line:?}"
+            );
+        }
     }
 
     fn render_to_rows(feed: &Arc<Mutex<UiFeed>>, input: &str, cursor: usize) -> Vec<String> {
