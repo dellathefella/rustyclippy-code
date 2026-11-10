@@ -120,8 +120,9 @@ DeepSeek V4.1 Flash has a 256k window. The agent compacts when
 estimated_prompt_tokens + max_output_tokens >= autocompact_at_tokens
 ```
 
-with `autocompact_at_tokens = 250000`. This leaves headroom for the response and
-avoids a hard-context failure. Compaction is skipped when it would free fewer
+with `autocompact_at_tokens = 983040` (the 1M window minus the 64k output
+budget). This leaves headroom for the response and avoids a hard-context
+failure. Compaction is skipped when it would free fewer
 than `min_compaction_gain_tokens`, so small overages do not trigger pointless
 rewrites.
 

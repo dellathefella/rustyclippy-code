@@ -282,8 +282,9 @@ The head bytes never change, which is what lets the KV cache survive compaction.
 
 | Setting | Default | Why |
 | --- | --- | --- |
-| `max_context_tokens` | `262144` | 256k window |
-| `autocompact_at_tokens` | `250000` | compact before the hard limit, leaving room for output |
+| `max_context_tokens` | `1048576` | 1M window |
+| `max_output_tokens` | `65536` | the server's output budget (MLX reports `agent_budget.output`); the architecture allows 384K, but a local server budgets far less |
+| `autocompact_at_tokens` | `983040` | context minus output, so a full-length answer still fits |
 | `cache.granularity` | `64` | DeepSeek prefix cache block size |
 | `reasoning_effort` | `high` | matches the harness knob (`off`/`low`/`high`/`max`) |
 | `include_reasoning_in_history` | `false` | replaying reasoning bloats the prefix and reasoner models reject it |

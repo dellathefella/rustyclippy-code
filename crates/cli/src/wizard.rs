@@ -160,18 +160,31 @@ pub async fn run(path: Option<PathBuf>, yes: bool, force: bool) -> Result<()> {
         }
     }
 
-    let context_tokens = 262_144usize;
-    let autocompact = 250_000usize;
+    let endpoint = base_url
+        .clone()
+        .unwrap_or_else(|| "http://127.0.0.1:8080/v1".to_string());
+    let model_id = model.unwrap_or_else(|| ProviderConfig::default().model);
+
+    // Prefer the server's own limits; fall back to the model defaults.
+    let mut provider = ProviderConfig {
+        kind,
+        base_url: endpoint.clone(),
+        model: model_id.clone(),
+        ..ProviderConfig::default()
+    };
+    if let Some((context, output)) = probe_budget(&endpoint, &model_id).await {
+        provider.clamp_context_to(context);
+        provider.clamp_output_to(output);
+    }
+    let context_tokens = provider.max_context_tokens;
+    let autocompact = context_tokens.saturating_sub(provider.max_output_tokens);
 
     let config = Config {
         provider: ProviderConfig {
-            kind,
-            base_url: base_url
-                .clone()
-                .unwrap_or_else(|| "http://127.0.0.1:8080/v1".to_string()),
-            model: model.unwrap_or_else(|| ProviderConfig::default().model),
+            base_url: endpoint,
+            model: model_id,
             max_context_tokens: context_tokens,
-            max_output_tokens: 8_192,
+            max_output_tokens: provider.max_output_tokens,
             reasoning_effort: effort,
             cache_prompt: kind == ProviderKind::OpenAiCompat,
             api_key_env: if kind == ProviderKind::Deepseek {
@@ -234,6 +247,43 @@ fn prompt(question: &str, default: &str) -> Result<String> {
     } else {
         Ok(trimmed.to_string())
     }
+}
+
+/// Context window and output budget the server reports for `model`.
+///
+/// Local servers expose their real limits (`context_length` and
+/// `agent_budget.output`), which are authoritative: requesting more output than
+/// the server budgets is rejected or silently truncated.
+async fn probe_budget(base_url: &str, model: &str) -> Option<(usize, usize)> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    let entry = value
+        .get("data")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(|id| id.as_str()) == Some(model))?;
+    let context = entry
+        .get("context_length")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let output = entry
+        .get("agent_budget")
+        .and_then(|budget| budget.get("output"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    if context == 0 && output == 0 {
+        return None;
+    }
+    Some((context, output))
 }
 
 async fn probe(base_url: &str) -> Option<Vec<String>> {

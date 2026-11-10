@@ -939,6 +939,43 @@ pub async fn doctor(config: &Config) -> Result<()> {
                                 println!("  served model:    {id}");
                             }
                         }
+                        // Report the budget the server actually enforces for the
+                        // configured model, and flag a config that exceeds it.
+                        if let Some(entry) = models.iter().find(|model| {
+                            model.get("id").and_then(|value| value.as_str())
+                                == Some(config.provider.model.as_str())
+                        }) {
+                            let context = entry
+                                .get("context_length")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0) as usize;
+                            let output = entry
+                                .get("agent_budget")
+                                .and_then(|budget| budget.get("output"))
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0) as usize;
+                            if context > 0 {
+                                println!("  server context:  {} tokens", fmt_num(context));
+                            }
+                            if output > 0 {
+                                println!("  server output:   {} tokens", fmt_num(output));
+                            }
+                            if output > 0 && config.provider.max_output_tokens > output {
+                                println!(
+                                    "  warning:         configured output {} exceeds the server budget {}; \
+                                     requests will be clamped",
+                                    fmt_num(config.provider.max_output_tokens),
+                                    fmt_num(output)
+                                );
+                            }
+                            if context > 0 && config.provider.max_context_tokens > context {
+                                println!(
+                                    "  warning:         configured context {} exceeds the server window {}",
+                                    fmt_num(config.provider.max_context_tokens),
+                                    fmt_num(context)
+                                );
+                            }
+                        }
                     }
                 }
             } else {

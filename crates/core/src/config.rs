@@ -16,6 +16,22 @@ use serde::{Deserialize, Serialize};
 use crate::session::default_home;
 use crate::token::DEEPSEEK_CACHE_GRANULARITY;
 
+/// DeepSeek V4.1 Flash context window (1M tokens).
+pub const DEEPSEEK_V41_CONTEXT_TOKENS: usize = 1_048_576;
+
+/// DeepSeek V4.1 Flash output ceiling (384K tokens).
+///
+/// The architecture allows 384K, but a local server budgets far less: MLX
+/// reports `agent_budget.output = 65536` for this model. Requesting more than
+/// the server allows is rejected or silently clamped, so the default tracks the
+/// server's budget rather than the architectural maximum.
+pub const DEEPSEEK_V41_OUTPUT_TOKENS: usize = 65_536;
+
+/// Autocompaction threshold: the context window minus the output budget, so a
+/// full-length answer still fits after the prompt.
+pub const DEEPSEEK_V41_AUTOCOMPACT_TOKENS: usize =
+    DEEPSEEK_V41_CONTEXT_TOKENS - DEEPSEEK_V41_OUTPUT_TOKENS;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -64,9 +80,10 @@ impl Default for ProviderConfig {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             model: "DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw".to_string(),
-            // DeepSeek V4.1 Flash: 256k context. Autocompaction fires at 250k.
-            max_context_tokens: 262_144,
-            max_output_tokens: 8_192,
+            // DeepSeek V4.1 Flash: 1M context, 64k output budget on a local
+            // server. Autocompaction fires at context minus output.
+            max_context_tokens: DEEPSEEK_V41_CONTEXT_TOKENS,
+            max_output_tokens: DEEPSEEK_V41_OUTPUT_TOKENS,
             temperature: 0.2,
             cache_prompt: true,
             include_reasoning_in_history: false,
@@ -84,8 +101,8 @@ impl ProviderConfig {
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             model: model.unwrap_or_else(|| "deepseek-v4.1-flash".to_string()),
-            max_context_tokens: 262_144,
-            max_output_tokens: 8_192,
+            max_context_tokens: DEEPSEEK_V41_CONTEXT_TOKENS,
+            max_output_tokens: DEEPSEEK_V41_OUTPUT_TOKENS,
             temperature: 0.2,
             cache_prompt: false, // hosted API caches automatically
             include_reasoning_in_history: false,
@@ -207,7 +224,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            autocompact_at_tokens: 250_000,
+            autocompact_at_tokens: DEEPSEEK_V41_AUTOCOMPACT_TOKENS,
             compaction_threshold: 0.85,
             head_messages: 2,
             tail_messages: 8,
@@ -217,6 +234,28 @@ impl Default for CacheConfig {
             assume_warm_resume: false,
             summary_max_tokens: 1_024,
         }
+    }
+}
+
+impl ProviderConfig {
+    /// Clamp the output budget to what the server actually allows.
+    ///
+    /// A local server reports its own ceiling (MLX exposes `agent_budget.output`).
+    /// Requesting more than that is rejected or silently truncated, so the
+    /// configured value is lowered to fit. Returns the value that was applied.
+    pub fn clamp_output_to(&mut self, server_output: usize) -> usize {
+        if server_output > 0 && self.max_output_tokens > server_output {
+            self.max_output_tokens = server_output;
+        }
+        self.max_output_tokens
+    }
+
+    /// Clamp the context window to what the server reports.
+    pub fn clamp_context_to(&mut self, server_context: usize) -> usize {
+        if server_context > 0 && self.max_context_tokens > server_context {
+            self.max_context_tokens = server_context;
+        }
+        self.max_context_tokens
     }
 }
 
@@ -526,9 +565,40 @@ mod tests {
     #[test]
     fn autocompact_budget_prefers_absolute() {
         let cache = CacheConfig::default();
-        assert_eq!(cache.autocompact_budget(262_144), 250_000);
+        assert_eq!(
+            cache.autocompact_budget(DEEPSEEK_V41_CONTEXT_TOKENS),
+            DEEPSEEK_V41_AUTOCOMPACT_TOKENS
+        );
         let mut fallback = cache.clone();
         fallback.autocompact_at_tokens = 0;
         assert_eq!(fallback.autocompact_budget(100_000), 85_000);
+    }
+
+    #[test]
+    fn defaults_match_the_deepseek_v41_window() {
+        let config = Config::default();
+        assert_eq!(config.provider.max_context_tokens, 1_048_576);
+        assert_eq!(config.provider.max_output_tokens, 65_536);
+        // Autocompaction leaves room for a full-length answer.
+        assert_eq!(
+            config.cache.autocompact_at_tokens,
+            config.provider.max_context_tokens - config.provider.max_output_tokens
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn output_is_clamped_to_the_server_budget() {
+        let mut provider = ProviderConfig::default();
+        assert_eq!(provider.clamp_output_to(65_536), 65_536, "equal is kept");
+        assert_eq!(provider.clamp_output_to(32_768), 32_768, "lowered to fit");
+        assert_eq!(provider.clamp_output_to(0), 32_768, "zero means unknown");
+    }
+
+    #[test]
+    fn context_is_clamped_to_the_server_window() {
+        let mut provider = ProviderConfig::default();
+        assert_eq!(provider.clamp_context_to(262_144), 262_144);
+        assert_eq!(provider.clamp_context_to(0), 262_144, "zero means unknown");
     }
 }
