@@ -13,7 +13,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use rustyclippy_core::{canonical_string, Message, ProviderConfig, ProviderKind, Role};
 use serde_json::{json, Value};
 
-use crate::provider::{LlmRequest, Provider, StreamEvent};
+use crate::provider::{FinishReason, LlmRequest, Provider, StreamEvent};
 use crate::usage::parse_usage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +245,15 @@ impl Provider for OpenAiProvider {
                         yield StreamEvent::Usage(parse_usage(usage_value));
                     }
                 }
+                if let Some(reason) = value
+                    .get("choices")
+                    .and_then(|v| v.as_array())
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    yield StreamEvent::Finished(FinishReason::parse(reason));
+                }
                 yield StreamEvent::Done;
             };
             return Ok(Box::pin(stream));
@@ -254,6 +263,7 @@ impl Provider for OpenAiProvider {
         let stream = async_stream::try_stream! {
             let mut buffer = SseBuffer::default();
             let mut finished = false;
+            let mut finish: Option<FinishReason> = None;
 
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.context("reading SSE chunk")?;
@@ -275,6 +285,13 @@ impl Provider for OpenAiProvider {
 
                         if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
                             for choice in choices {
+                                // The server reports why it stopped on the final
+                                // chunk; `length` means the output was cut off.
+                                if let Some(reason) =
+                                    choice.get("finish_reason").and_then(|v| v.as_str())
+                                {
+                                    finish = Some(FinishReason::parse(reason));
+                                }
                                 let delta = choice.get("delta").unwrap_or(&Value::Null);
                                 if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                                     if !content.is_empty() {
@@ -335,6 +352,9 @@ impl Provider for OpenAiProvider {
                 }
             }
 
+            if let Some(reason) = finish {
+                yield StreamEvent::Finished(reason);
+            }
             yield StreamEvent::Done;
         };
 
@@ -418,6 +438,27 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_reason_parses_known_values() {
+        assert_eq!(FinishReason::parse("stop"), FinishReason::Stop);
+        assert_eq!(FinishReason::parse("length"), FinishReason::Length);
+        assert_eq!(FinishReason::parse("tool_calls"), FinishReason::ToolCalls);
+        assert_eq!(
+            FinishReason::parse("content_filter"),
+            FinishReason::ContentFilter
+        );
+        assert_eq!(FinishReason::parse("weird"), FinishReason::Other);
+    }
+
+    #[test]
+    fn only_length_counts_as_truncation() {
+        assert!(FinishReason::Length.is_truncated());
+        assert!(!FinishReason::Stop.is_truncated());
+        assert!(!FinishReason::ToolCalls.is_truncated());
+        assert!(!FinishReason::ContentFilter.is_truncated());
+        assert!(!FinishReason::Other.is_truncated());
+    }
 
     #[test]
     fn sse_buffer_decodes_utf8_split_across_chunks() {

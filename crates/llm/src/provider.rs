@@ -57,6 +57,53 @@ impl Usage {
     }
 }
 
+/// Why the server stopped generating.
+///
+/// `Length` means the output hit `max_tokens` and was cut off mid-stream. That
+/// is not a normal end of turn: reasoning can consume the whole budget and
+/// leave no answer, so the agent has to report it instead of silently
+/// committing a truncated message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model finished its answer normally.
+    Stop,
+    /// Output hit `max_tokens` and was truncated.
+    Length,
+    /// The model asked for tools.
+    ToolCalls,
+    /// Content was filtered by the server.
+    ContentFilter,
+    /// Anything else the server reported.
+    Other,
+}
+
+impl FinishReason {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "stop" => FinishReason::Stop,
+            "length" => FinishReason::Length,
+            "tool_calls" | "function_call" => FinishReason::ToolCalls,
+            "content_filter" => FinishReason::ContentFilter,
+            _ => FinishReason::Other,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishReason::Stop => "stop",
+            FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
+            FinishReason::ContentFilter => "content_filter",
+            FinishReason::Other => "other",
+        }
+    }
+
+    /// True when the server cut generation short.
+    pub fn is_truncated(self) -> bool {
+        self == FinishReason::Length
+    }
+}
+
 /// Incremental stream event.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -69,6 +116,8 @@ pub enum StreamEvent {
         args_fragment: Option<String>,
     },
     Usage(Usage),
+    /// The server reported why it stopped. Emitted before `Done`.
+    Finished(FinishReason),
     Done,
 }
 

@@ -303,15 +303,40 @@ impl UiFeed {
     /// Starting a new block resets the reveal cursor; ending one reveals the
     /// whole block so nothing stays hidden after the stream stops.
     pub fn set_thinking(&mut self, thinking: bool, tokens: usize) {
-        if thinking && !self.thinking {
-            self.thinking_chars = 0;
-            self.thinking_revealed = 0;
-        }
         if !thinking {
             self.thinking_revealed = self.thinking_chars;
         }
         self.thinking = thinking;
         self.thinking_tokens = tokens;
+        self.revision += 1;
+    }
+
+    /// Start a new reasoning block.
+    ///
+    /// Called explicitly by the agent on the first chunk of each block, so the
+    /// reveal cursor resets even when the previous block never closed (an
+    /// interrupt, or a stream that errored mid-reasoning). Without this the
+    /// cursor spans both blocks' text and the reveal looks truncated.
+    pub fn begin_thinking(&mut self) {
+        self.thinking_chars = 0;
+        self.thinking_revealed = 0;
+        self.thinking = true;
+        self.thinking_tokens = 0;
+        self.revision += 1;
+    }
+
+    /// Close the current reasoning block.
+    ///
+    /// Called at the end of every streamed block, including interrupted and
+    /// truncated turns. Without it a block that never ends leaves `thinking`
+    /// stuck true, so the next block's reveal cursor spans both blocks' text.
+    pub fn finish_thinking(&mut self) {
+        if !self.thinking {
+            return;
+        }
+        self.thinking_revealed = self.thinking_chars;
+        self.thinking = false;
+        self.thinking_tokens = 0;
         self.revision += 1;
     }
 
@@ -704,6 +729,11 @@ impl Output {
         if self.feed().is_some() {
             if let Some(feed) = self.feed() {
                 if let Ok(mut feed) = feed.lock() {
+                    // The first chunk of a block resets the reveal cursor, so a
+                    // block that never closed cannot swallow the next one.
+                    if !feed.thinking() {
+                        feed.begin_thinking();
+                    }
                     feed.set_thinking(true, tokens);
                 }
             }
@@ -742,7 +772,7 @@ impl Output {
         if self.feed().is_some() {
             if let Some(feed) = self.feed() {
                 if let Ok(mut feed) = feed.lock() {
-                    feed.set_thinking(false, 0);
+                    feed.finish_thinking();
                 }
             }
             return;
@@ -1213,14 +1243,56 @@ mod tests {
     }
 
     #[test]
-    fn a_new_block_resets_the_reveal_cursor() {
+    fn an_unclosed_block_does_not_swallow_the_next_one() {
+        // An interrupted turn can leave `thinking` true. The next block must
+        // still start hidden instead of revealing a prefix spanning both.
+        let mut feed = UiFeed::default();
+        feed.begin_thinking();
+        feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("old block text".into()));
+        feed.reveal_thinking();
+        assert!(feed.thinking_revealed() > 0);
+
+        // No finish_thinking() call: simulate an interrupt. The agent starts the
+        // next block explicitly, which must reset the cursor.
+        feed.begin_thinking();
+        feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("new block".into()));
+        assert_eq!(
+            feed.thinking_revealed(),
+            0,
+            "a new block must start hidden even if the old one never closed"
+        );
+    }
+
+    #[test]
+    fn finish_thinking_closes_the_block() {
         let mut feed = UiFeed::default();
         feed.set_thinking(true, 0);
+        feed.push(FeedEntry::Reasoning("abcdefgh".into()));
+        feed.reveal_thinking();
+        assert!(feed.thinking());
+
+        feed.finish_thinking();
+        assert!(!feed.thinking(), "block must be closed");
+        assert_eq!(feed.thinking_revealed(), 8, "nothing may stay hidden");
+        assert_eq!(feed.thinking_tokens(), 0);
+
+        // Closing twice is harmless.
+        feed.finish_thinking();
+        assert!(!feed.thinking());
+    }
+
+    #[test]
+    fn a_new_block_resets_the_reveal_cursor() {
+        let mut feed = UiFeed::default();
+        feed.begin_thinking();
+        feed.set_thinking(true, 0);
         feed.push(FeedEntry::Reasoning("first".into()));
-        feed.set_thinking(false, 0);
+        feed.finish_thinking();
         assert_eq!(feed.thinking_revealed(), 5);
 
-        feed.set_thinking(true, 0);
+        feed.begin_thinking();
         assert_eq!(feed.thinking_revealed(), 0, "new block starts hidden");
     }
 

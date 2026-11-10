@@ -17,7 +17,7 @@ use rustyclippy_core::{
     system_prompt::{environment_message, system_prompt},
     CacheEngine, ImageAttachment, RequestPlan, Transcript,
 };
-use rustyclippy_llm::{build_provider, LlmRequest, Provider, StreamEvent, Usage};
+use rustyclippy_llm::{build_provider, FinishReason, LlmRequest, Provider, StreamEvent, Usage};
 use rustyclippy_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
 use serde_json::Value;
 
@@ -731,6 +731,7 @@ impl Agent {
             let mut reasoning = String::new();
             let mut usage = Usage::default();
             let mut assembler = ToolCallAssembler::default();
+            let mut finish: Option<FinishReason> = None;
 
             // Poll the stream with a timeout so an interrupt is noticed even
             // when the server stalls between chunks.
@@ -761,12 +762,29 @@ impl Agent {
                         args_fragment,
                     } => assembler.push(index, id, name, args_fragment),
                     StreamEvent::Usage(value) => usage = value,
+                    StreamEvent::Finished(reason) => finish = Some(reason),
                     StreamEvent::Done => break,
                 }
             }
 
             if !reasoning.is_empty() {
                 self.output.reasoning_end();
+            }
+            // A `length` finish means the server cut generation off at
+            // `max_tokens`. Reasoning can consume the entire budget, leaving no
+            // answer at all, so report it instead of committing a truncated
+            // message as if the turn had completed.
+            if finish.map(FinishReason::is_truncated).unwrap_or(false) {
+                self.output.warning(&format!(
+                    "output hit the {} token limit and was cut off{}; the turn is incomplete \
+                     (raise provider.max_output_tokens to allow longer answers)",
+                    fmt_num(self.config.provider.max_output_tokens),
+                    if text.trim().is_empty() && !reasoning.is_empty() {
+                        " before any answer was produced (reasoning used the whole budget)"
+                    } else {
+                        ""
+                    }
+                ));
             }
             if !text.is_empty() {
                 self.output.line_break();
@@ -1448,6 +1466,70 @@ mod step_limit {
             })
             .unwrap();
         (agent, dir)
+    }
+
+    /// Streams reasoning that consumes the whole budget, then reports `length`.
+    struct TruncatedProvider;
+
+    #[async_trait]
+    impl Provider for TruncatedProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(
+            &self,
+            _request: LlmRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+            let events = vec![
+                Ok(StreamEvent::Reasoning("thinking hard".into())),
+                Ok(StreamEvent::Usage(Usage {
+                    prompt_tokens: 100,
+                    cached_tokens: 80,
+                    completion_tokens: 8_192,
+                    reasoning_tokens: 8_192,
+                    decode_tokens_per_second: None,
+                })),
+                Ok(StreamEvent::Finished(FinishReason::Length)),
+                Ok(StreamEvent::Done),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_is_reported_not_silently_committed() {
+        let (mut agent, _dir) = agent_with_limit(3);
+        agent.provider = Arc::new(TruncatedProvider);
+        // Route chrome into a feed so the warning can be asserted.
+        let feed = Arc::new(std::sync::Mutex::new(crate::ui::UiFeed::default()));
+        agent.output = Output::tui(feed.clone());
+
+        let result = agent
+            .run_turn_with_images("think about it", Vec::new())
+            .await
+            .expect("truncation should not fail the turn");
+
+        let notices: Vec<String> = feed
+            .lock()
+            .unwrap()
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::ui::FeedEntry::Notice { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let chrome = notices.join("\n");
+        assert!(
+            chrome.contains("token limit") || chrome.contains("cut off"),
+            "truncation must be reported, got: {chrome}"
+        );
+        assert!(
+            chrome.contains("reasoning used the whole budget"),
+            "an answer-less truncation must say why, got: {chrome}"
+        );
+        assert!(result.text.trim().is_empty(), "no answer was produced");
     }
 
     #[tokio::test]
