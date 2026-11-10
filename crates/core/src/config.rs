@@ -16,8 +16,19 @@ use serde::{Deserialize, Serialize};
 use crate::session::default_home;
 use crate::token::DEEPSEEK_CACHE_GRANULARITY;
 
-/// DeepSeek V4.1 Flash context window (1M tokens).
+/// DeepSeek V4.1 Flash architectural context window (1M tokens).
+///
+/// This is what the model accepts, not what it recalls well. See
+/// [`DEFAULT_CONTEXT_TOKENS`] for the window actually used.
 pub const DEEPSEEK_V41_CONTEXT_TOKENS: usize = 1_048_576;
+
+/// Working context window used by default (300k tokens).
+///
+/// The model accepts 1M tokens, but recall degrades well before that: past
+/// roughly 300k it starts losing earlier turns, so a longer prompt buys capacity
+/// without buying fidelity. Capping the window keeps compaction firing while the
+/// transcript is still fully recallable.
+pub const DEFAULT_CONTEXT_TOKENS: usize = 300_000;
 
 /// DeepSeek V4.1 Flash output ceiling (384K tokens).
 ///
@@ -27,10 +38,9 @@ pub const DEEPSEEK_V41_CONTEXT_TOKENS: usize = 1_048_576;
 /// server's budget rather than the architectural maximum.
 pub const DEEPSEEK_V41_OUTPUT_TOKENS: usize = 65_536;
 
-/// Autocompaction threshold: the context window minus the output budget, so a
+/// Autocompaction threshold: the working window minus the output budget, so a
 /// full-length answer still fits after the prompt.
-pub const DEEPSEEK_V41_AUTOCOMPACT_TOKENS: usize =
-    DEEPSEEK_V41_CONTEXT_TOKENS - DEEPSEEK_V41_OUTPUT_TOKENS;
+pub const DEFAULT_AUTOCOMPACT_TOKENS: usize = DEFAULT_CONTEXT_TOKENS - DEEPSEEK_V41_OUTPUT_TOKENS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,9 +90,10 @@ impl Default for ProviderConfig {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             model: "DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw".to_string(),
-            // DeepSeek V4.1 Flash: 1M context, 64k output budget on a local
-            // server. Autocompaction fires at context minus output.
-            max_context_tokens: DEEPSEEK_V41_CONTEXT_TOKENS,
+            // DeepSeek V4.1 Flash: a 300k working window (recall degrades past
+            // that) and a 64k output budget on a local server. Autocompaction
+            // fires at window minus output.
+            max_context_tokens: DEFAULT_CONTEXT_TOKENS,
             max_output_tokens: DEEPSEEK_V41_OUTPUT_TOKENS,
             temperature: 0.2,
             cache_prompt: true,
@@ -101,7 +112,7 @@ impl ProviderConfig {
             base_url: "https://api.deepseek.com/v1".to_string(),
             api_key_env: "DEEPSEEK_API_KEY".to_string(),
             model: model.unwrap_or_else(|| "deepseek-v4.1-flash".to_string()),
-            max_context_tokens: DEEPSEEK_V41_CONTEXT_TOKENS,
+            max_context_tokens: DEFAULT_CONTEXT_TOKENS,
             max_output_tokens: DEEPSEEK_V41_OUTPUT_TOKENS,
             temperature: 0.2,
             cache_prompt: false, // hosted API caches automatically
@@ -224,7 +235,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            autocompact_at_tokens: DEEPSEEK_V41_AUTOCOMPACT_TOKENS,
+            autocompact_at_tokens: DEFAULT_AUTOCOMPACT_TOKENS,
             compaction_threshold: 0.85,
             head_messages: 2,
             tail_messages: 8,
@@ -566,8 +577,8 @@ mod tests {
     fn autocompact_budget_prefers_absolute() {
         let cache = CacheConfig::default();
         assert_eq!(
-            cache.autocompact_budget(DEEPSEEK_V41_CONTEXT_TOKENS),
-            DEEPSEEK_V41_AUTOCOMPACT_TOKENS
+            cache.autocompact_budget(DEFAULT_CONTEXT_TOKENS),
+            DEFAULT_AUTOCOMPACT_TOKENS
         );
         let mut fallback = cache.clone();
         fallback.autocompact_at_tokens = 0;
@@ -575,16 +586,28 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_the_deepseek_v41_window() {
+    fn defaults_use_the_300k_working_window() {
         let config = Config::default();
-        assert_eq!(config.provider.max_context_tokens, 1_048_576);
+        assert_eq!(config.provider.max_context_tokens, 300_000);
         assert_eq!(config.provider.max_output_tokens, 65_536);
         // Autocompaction leaves room for a full-length answer.
         assert_eq!(
             config.cache.autocompact_at_tokens,
             config.provider.max_context_tokens - config.provider.max_output_tokens
         );
+        assert_eq!(config.cache.autocompact_at_tokens, 234_464);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_working_window_is_below_the_architectural_one() {
+        // The model accepts 1M tokens but recall degrades past ~300k, so the
+        // default window must stay well under the architectural maximum.
+        let config = Config::default();
+        assert!(
+            config.provider.max_context_tokens < DEEPSEEK_V41_CONTEXT_TOKENS,
+            "the working window must stay below the architectural maximum"
+        );
     }
 
     #[test]
