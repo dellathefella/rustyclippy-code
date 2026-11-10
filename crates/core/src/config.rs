@@ -150,6 +150,14 @@ impl AgentMode {
             other => bail!("unknown mode `{other}` (expected build or plan)"),
         }
     }
+
+    /// The other mode, for cycling with Shift+Tab.
+    pub fn toggle(self) -> Self {
+        match self {
+            AgentMode::Build => AgentMode::Plan,
+            AgentMode::Plan => AgentMode::Build,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -494,6 +502,13 @@ mod tests {
         assert_eq!(AgentMode::parse("BUILD").unwrap(), AgentMode::Build);
         assert_eq!(AgentMode::parse("plan").unwrap(), AgentMode::Plan);
         assert!(AgentMode::parse("nope").is_err());
+    }
+
+    #[test]
+    fn mode_toggle_cycles_between_build_and_plan() {
+        assert_eq!(AgentMode::Build.toggle(), AgentMode::Plan);
+        assert_eq!(AgentMode::Plan.toggle(), AgentMode::Build);
+        assert_eq!(AgentMode::Build.toggle().toggle(), AgentMode::Build);
     }
 
     #[test]

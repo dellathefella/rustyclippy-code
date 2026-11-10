@@ -38,6 +38,8 @@ const RAIL: Color = Color::Rgb(0x3a, 0x3a, 0x48);
 pub enum TuiOutcome {
     /// A prompt was submitted; drain it with [`Tui::take_submitted`].
     Prompt,
+    /// The user asked to switch between build and plan mode.
+    ToggleMode,
     /// The user asked to quit.
     Exit,
 }
@@ -62,6 +64,8 @@ pub struct Tui {
     spinner: usize,
     /// Prompt history for Up/Down recall.
     history: crate::history::History,
+    /// Set when Shift+Tab asked for a mode switch; the caller drains it.
+    toggle_mode: bool,
     quit: bool,
 }
 
@@ -86,6 +90,7 @@ impl Tui {
             pending_images: Vec::new(),
             spinner: 0,
             history,
+            toggle_mode: false,
             quit: false,
         })
     }
@@ -197,6 +202,22 @@ impl Tui {
                 self.attach_clipboard_image();
                 self.dirty = true;
                 Ok(None)
+            }
+            // Shift+Tab cycles build ↔ plan. Refused mid-turn: switching rebuilds
+            // the system prompt and tool block, which would corrupt a running
+            // request.
+            KeyCode::BackTab => {
+                if self.feed.lock().map(|feed| feed.busy()).unwrap_or(false) {
+                    if let Ok(mut feed) = self.feed.lock() {
+                        feed.push(FeedEntry::Notice {
+                            level: NoticeLevel::Warning,
+                            text: "cannot switch mode while a turn is running".to_string(),
+                        });
+                    }
+                    self.dirty = true;
+                    return Ok(None);
+                }
+                Ok(Some(TuiOutcome::ToggleMode))
             }
             KeyCode::Char(ch) => {
                 self.input.insert(self.cursor, ch);
@@ -387,6 +408,11 @@ impl Tui {
         self.submitted.take()
     }
 
+    /// Drain a pending mode-switch request, if any.
+    pub fn take_toggle_mode(&mut self) -> bool {
+        std::mem::take(&mut self.toggle_mode)
+    }
+
     pub fn quit(&self) -> bool {
         self.quit
     }
@@ -394,7 +420,9 @@ impl Tui {
     /// Wait up to `timeout` for input; returns true when an event was handled.
     pub fn poll(&mut self, timeout: Duration) -> Result<bool> {
         if event::poll(timeout).context("polling terminal")? {
-            self.handle_event()?;
+            if let Some(TuiOutcome::ToggleMode) = self.handle_event()? {
+                self.toggle_mode = true;
+            }
             return Ok(true);
         }
         Ok(false)
@@ -810,7 +838,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Tot
             Style::default().fg(Color::White),
         ),
         Span::styled(
-            "  ↑↓ scroll · esc interrupt · ^V image · ^C quit",
+            "  ⇥ mode · esc stop · ^C quit",
             Style::default().fg(MUTED),
         ),
     ]);
@@ -1115,6 +1143,17 @@ mod tests {
         assert!(feed.busy());
         feed.set_busy(false);
         assert!(!feed.busy());
+    }
+
+    #[test]
+    fn footer_advertises_mode_and_interrupt_keys() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        let screen = render_to_rows(&feed, "", 0).join("\n");
+        assert!(screen.contains("mode"), "mode hint missing:\n{screen}");
+        assert!(
+            screen.contains("esc stop"),
+            "interrupt hint missing:\n{screen}"
+        );
     }
 
     #[test]

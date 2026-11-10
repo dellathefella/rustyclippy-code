@@ -223,6 +223,10 @@ async fn run_tui_loop(
         if !tui.poll(std::time::Duration::from_millis(50))? {
             continue;
         }
+        if tui.take_toggle_mode() {
+            toggle_mode(agent)?;
+            continue;
+        }
         let Some(line) = tui.take_submitted() else {
             if tui.quit() {
                 break;
@@ -257,6 +261,13 @@ async fn run_tui_loop(
             feed.set_busy(false);
         }
     }
+    Ok(())
+}
+
+/// Flip between build and plan mode, refreshing the header.
+fn toggle_mode(agent: &mut Agent) -> Result<()> {
+    agent.switch_mode(agent.mode.toggle())?;
+    print_header(agent);
     Ok(())
 }
 
