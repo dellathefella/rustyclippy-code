@@ -178,6 +178,12 @@ Ctrl+V                attach the clipboard image
 Ctrl+C                quit
 ```
 
+Prompts submitted while a turn is running are queued rather than dropped: they
+appear dimmed above the input line with a `⏳` marker, the prompt box title shows
+the count, and each runs in order once the current turn finishes. Esc interrupts
+the turn and clears the queue, since interrupting means reprompting rather than
+running the backlog.
+
 Approvals appear in the prompt box instead of on stderr, so a batch of tool
 calls is answered without leaving the screen: `Y` allows, `n` denies, `a`
 allows for the rest of the session, and `s` chooses each call individually.

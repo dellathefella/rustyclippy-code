@@ -61,8 +61,9 @@ pub struct Tui {
     last_revision: u64,
     /// Set when the input line or scroll offset changed, forcing a redraw.
     dirty: bool,
-    /// Set when the user pressed Enter; the caller drains it.
-    submitted: Option<String>,
+    /// Prompts submitted with Enter, in order. The caller drains them one at a
+    /// time, so a prompt typed while a turn runs is queued rather than lost.
+    submitted: Vec<String>,
     /// Images attached to the next prompt.
     pending_images: Vec<rustyclippy_core::ImageAttachment>,
     /// Spinner frame, advanced on every draw while a turn is in flight.
@@ -91,7 +92,7 @@ impl Tui {
             scroll: 0,
             last_revision: u64::MAX,
             dirty: true,
-            submitted: None,
+            submitted: Vec::new(),
             pending_images: Vec::new(),
             spinner: 0,
             history,
@@ -134,18 +135,18 @@ impl Tui {
         let cursor = self.cursor;
         let scroll = self.scroll;
         let spinner = self.spinner;
+        let queued = self.submitted.clone();
+        let state = FrameState {
+            feed: &feed,
+            input: &input,
+            cursor,
+            scroll,
+            pending_images,
+            spinner,
+            queued: &queued,
+        };
         self.terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    &feed,
-                    &input,
-                    cursor,
-                    scroll,
-                    pending_images,
-                    spinner,
-                )
-            })
+            .draw(|frame| render(frame, &state))
             .context("drawing frame")?;
         Ok(())
     }
@@ -188,7 +189,7 @@ impl Tui {
                 }
                 self.history.push(&trimmed);
                 self.history.save();
-                self.submitted = Some(trimmed);
+                self.submitted.push(trimmed);
                 Ok(Some(TuiOutcome::Prompt))
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -319,6 +320,9 @@ impl Tui {
                     if let Ok(mut feed) = self.feed.lock() {
                         feed.request_interrupt();
                     }
+                    // An interrupt abandons the queued prompts too: the user is
+                    // stopping to reprompt, not to run the backlog.
+                    self.clear_queued();
                 } else {
                     self.scroll = 0;
                 }
@@ -445,9 +449,18 @@ impl Tui {
         Ok(None)
     }
 
-    /// Drain a submitted prompt, if any.
+    /// Drain the oldest submitted prompt, if any.
     pub fn take_submitted(&mut self) -> Option<String> {
-        self.submitted.take()
+        if self.submitted.is_empty() {
+            return None;
+        }
+        Some(self.submitted.remove(0))
+    }
+
+    /// Drop every queued prompt, used when the user interrupts a turn.
+    pub fn clear_queued(&mut self) {
+        self.submitted.clear();
+        self.dirty = true;
     }
 
     /// Drain a pending mode-switch request, if any.
@@ -477,15 +490,31 @@ fn up_recalls_history(input: &str, browsing: bool) -> bool {
     !input.is_empty() || browsing
 }
 
-fn render(
-    frame: &mut ratatui::Frame,
-    feed: &Arc<Mutex<UiFeed>>,
-    input: &str,
+/// Everything the renderer needs for one frame, so the signature stays small.
+struct FrameState<'a> {
+    feed: &'a Arc<Mutex<UiFeed>>,
+    input: &'a str,
     cursor: usize,
     scroll: usize,
     pending_images: usize,
     spinner: usize,
-) {
+    queued: &'a [String],
+}
+
+fn render(frame: &mut ratatui::Frame, state: &FrameState<'_>) {
+    let FrameState {
+        feed,
+        input,
+        cursor,
+        scroll,
+        pending_images,
+        spinner,
+        queued,
+    } = state;
+    let cursor = *cursor;
+    let scroll = *scroll;
+    let pending_images = *pending_images;
+    let spinner = *spinner;
     let area = frame.area();
 
     let (header, entries, approval, busy, totals) = match feed.lock() {
@@ -510,7 +539,8 @@ fn render(
             };
             (body as u16).saturating_add(2)
         }
-        None => 3,
+        // One extra row per queued prompt, so the list is never clipped.
+        None => INPUT_HEIGHT.saturating_add(queued.len() as u16),
     };
 
     let chunks = Layout::default()
@@ -532,6 +562,7 @@ fn render(
         cursor,
         approval.as_ref(),
         pending_images,
+        queued,
     );
     render_footer(frame, chunks[3], &totals);
 }
@@ -780,39 +811,50 @@ fn render_input(
     cursor: usize,
     approval: Option<&crate::ui::ApprovalRequest>,
     pending_images: usize,
+    queued: &[String],
 ) {
     if let Some(request) = approval {
         render_approval(frame, area, request);
         return;
     }
 
+    let mut title = String::from(" prompt ");
+    if pending_images > 0 {
+        title = format!(" prompt · {pending_images} image(s) ");
+    }
+    if !queued.is_empty() {
+        title = format!("{}{} queued ", title.trim_end(), queued.len());
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(
-            if pending_images > 0 {
-                format!(" prompt · {pending_images} image(s) ")
-            } else {
-                " prompt ".to_string()
-            },
-            Style::default().fg(ACCENT),
-        ));
+        .title(Span::styled(title, Style::default().fg(ACCENT)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let line = Line::from(vec![
+    // Queued prompts sit above the live input line, dimmed so they read as
+    // waiting work rather than something already sent.
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for prompt in queued {
+        lines.push(Line::from(vec![
+            Span::styled("⏳ ", Style::default().fg(MUTED)),
+            Span::styled(prompt.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines.push(Line::from(vec![
         Span::styled("› ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(input.to_string()),
-    ]);
-    frame.render_widget(Paragraph::new(line), inner);
+    ]));
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
-    // Place the real cursor so the terminal shows the caret.
+    // Place the real cursor so the terminal shows the caret. It sits on the
+    // input row, below any queued prompts.
     let prefix = 2u16;
     let offset = input[..cursor].chars().count() as u16;
     let x = inner.x.saturating_add(prefix).saturating_add(offset);
-    let y = inner.y;
-    if x < inner.x.saturating_add(inner.width) {
+    let y = inner.y.saturating_add(queued.len() as u16);
+    if x < inner.x.saturating_add(inner.width) && y < inner.y.saturating_add(inner.height) {
         frame.set_cursor_position((x, y));
     }
 }
@@ -939,7 +981,20 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, feed, input, cursor, scroll, 0, 0))
+            .draw(|frame| {
+                render(
+                    frame,
+                    &FrameState {
+                        feed,
+                        input,
+                        cursor,
+                        scroll,
+                        pending_images: 0,
+                        spinner: 0,
+                        queued: &[],
+                    },
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -952,12 +1007,34 @@ mod tests {
     }
 
     fn render_to_rows(feed: &Arc<Mutex<UiFeed>>, input: &str, cursor: usize) -> Vec<String> {
+        render_to_rows_queued(feed, input, cursor, &[])
+    }
+
+    fn render_to_rows_queued(
+        feed: &Arc<Mutex<UiFeed>>,
+        input: &str,
+        cursor: usize,
+        queued: &[String],
+    ) -> Vec<String> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, feed, input, cursor, 0, 0, 0))
+            .draw(|frame| {
+                render(
+                    frame,
+                    &FrameState {
+                        feed,
+                        input,
+                        cursor,
+                        scroll: 0,
+                        pending_images: 0,
+                        spinner: 0,
+                        queued,
+                    },
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1022,7 +1099,20 @@ mod tests {
             let backend = TestBackend::new(80, 24);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal
-                .draw(|frame| render(frame, &feed, "", 0, 0, 0, spinner))
+                .draw(|frame| {
+                    render(
+                        frame,
+                        &FrameState {
+                            feed: &feed,
+                            input: "",
+                            cursor: 0,
+                            scroll: 0,
+                            pending_images: 0,
+                            spinner,
+                            queued: &[],
+                        },
+                    )
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer();
             frames.push(
@@ -1049,7 +1139,20 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &feed, "", 0, 0, 2, 0))
+            .draw(|frame| {
+                render(
+                    frame,
+                    &FrameState {
+                        feed: &feed,
+                        input: "",
+                        cursor: 0,
+                        scroll: 0,
+                        pending_images: 2,
+                        spinner: 0,
+                        queued: &[],
+                    },
+                )
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let screen: String = (0..buffer.area.height)
@@ -1240,6 +1343,41 @@ mod tests {
         assert!(feed.busy());
         feed.set_busy(false);
         assert!(!feed.busy());
+    }
+
+    #[test]
+    fn queued_prompts_render_above_the_input() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        let queued = vec![
+            "first follow-up".to_string(),
+            "second follow-up".to_string(),
+        ];
+        let screen = render_to_rows_queued(&feed, "typing", 6, &queued).join("\n");
+        assert!(
+            screen.contains("first follow-up"),
+            "queued prompt missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("second follow-up"),
+            "queued prompt missing:\n{screen}"
+        );
+        assert!(
+            screen.contains("2 queued"),
+            "queue count missing:\n{screen}"
+        );
+        assert!(screen.contains("typing"), "live input missing:\n{screen}");
+    }
+
+    #[test]
+    fn submitted_prompts_queue_in_order() {
+        let mut queue: Vec<String> = Vec::new();
+        queue.push("one".to_string());
+        queue.push("two".to_string());
+        // Draining takes the oldest first, so a prompt typed mid-turn is not
+        // lost behind a later one.
+        assert_eq!(queue.remove(0), "one");
+        assert_eq!(queue.remove(0), "two");
+        assert!(queue.is_empty());
     }
 
     #[test]

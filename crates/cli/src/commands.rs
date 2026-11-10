@@ -233,6 +233,8 @@ async fn run_tui_loop(
             }
             continue;
         };
+        // Anything still queued stays visible above the prompt box until it is
+        // drained on the next iteration.
 
         if line.starts_with('/') {
             match handle_command(agent, &line, &mut pending_images, &context)? {
