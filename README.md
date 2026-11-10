@@ -166,7 +166,15 @@ rustyclippy-code config show
 
 `tui` opens a full-screen interface styled after opencode: a header with the
 model, mode, session and endpoint; a scrolling transcript pane; a bordered
-prompt box; and a footer with live token totals and cache-hit ratio.
+prompt box; and a two-row footer with live token totals, cache-hit ratio,
+decode speed and a context gauge.
+
+The footer's second row shows how close the next request is to triggering
+autocompaction: `ctx 85,000 / 250,000 (34%)`. The figure turns amber past 75%
+and red past 90%, so compaction is visible before it fires. Decode speed
+(`42.5 tok/s`) appears when the server reports it — llama.cpp exposes it under
+`timings.predicted_per_second`; providers that do not report it simply omit the
+field.
 
 ```text
 ↑ / ↓ / PgUp / PgDn   scroll the transcript
@@ -178,11 +186,11 @@ Ctrl+V                attach the clipboard image
 Ctrl+C                quit
 ```
 
-Prompts submitted while a turn is running are queued rather than dropped: they
-appear dimmed above the input line with a `⏳` marker, the prompt box title shows
-the count, and each runs in order once the current turn finishes. Esc interrupts
-the turn and clears the queue, since interrupting means reprompting rather than
-running the backlog.
+Prompts submitted while a turn is running are queued rather than dropped. They
+stack in their own pane directly above the prompt box, dimmed with a `⏳` marker
+and numbered in submission order, and each runs once the current turn finishes.
+Esc interrupts the turn and clears the queue, since interrupting means
+reprompting rather than running the backlog.
 
 Approvals appear in the prompt box instead of on stderr, so a batch of tool
 calls is answered without leaving the screen: `Y` allows, `n` denies, `a`

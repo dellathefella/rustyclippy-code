@@ -148,6 +148,12 @@ pub struct Totals {
     pub cached: usize,
     pub prefill: usize,
     pub completion: usize,
+    /// Estimated prompt tokens for the most recent request.
+    pub context_tokens: usize,
+    /// Token budget that triggers autocompaction.
+    pub compaction_budget: usize,
+    /// Decode speed of the most recent request, in tokens/s.
+    pub decode_tokens_per_second: Option<f64>,
 }
 
 impl Totals {
@@ -157,6 +163,14 @@ impl Totals {
         } else {
             self.cached as f64 / self.prompt as f64
         }
+    }
+
+    /// Fraction of the compaction budget currently in use, clamped to 1.0.
+    pub fn compaction_ratio(&self) -> f64 {
+        if self.compaction_budget == 0 {
+            return 0.0;
+        }
+        (self.context_tokens as f64 / self.compaction_budget as f64).min(1.0)
     }
 }
 
@@ -210,6 +224,22 @@ impl UiFeed {
 
     pub fn totals(&self) -> &Totals {
         &self.totals
+    }
+
+    /// Record how full the context is relative to the compaction budget, plus
+    /// the decode speed of the request that just finished.
+    pub fn set_context(
+        &mut self,
+        context_tokens: usize,
+        compaction_budget: usize,
+        decode_tokens_per_second: Option<f64>,
+    ) {
+        self.totals.context_tokens = context_tokens;
+        self.totals.compaction_budget = compaction_budget;
+        if decode_tokens_per_second.is_some() {
+            self.totals.decode_tokens_per_second = decode_tokens_per_second;
+        }
+        self.revision += 1;
     }
 
     pub fn add_turn(&mut self, prompt: usize, cached: usize, prefill: usize, completion: usize) {
@@ -289,6 +319,8 @@ pub struct Output {
     /// Render model reasoning ("thinking") in the transcript. On by default;
     /// shared across clones so `/thinking` toggles every surface at once.
     show_reasoning: Arc<AtomicBool>,
+    /// Token budget that triggers autocompaction, for the footer gauge.
+    compaction_budget: usize,
     /// Spinner frame counter for the animated thinking indicator.
     spinner: AtomicUsize,
     /// True while a reasoning block is streaming, so the spinner can be
@@ -306,6 +338,7 @@ impl Clone for Output {
             at_line_start: AtomicBool::new(self.at_line_start.load(Ordering::Relaxed)),
             feed: self.feed.clone(),
             show_reasoning: self.show_reasoning.clone(),
+            compaction_budget: self.compaction_budget,
             spinner: AtomicUsize::new(self.spinner.load(Ordering::Relaxed)),
             thinking: AtomicBool::new(self.thinking.load(Ordering::Relaxed)),
         }
@@ -325,6 +358,7 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: None,
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
         }
@@ -341,6 +375,7 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: None,
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
         }
@@ -356,6 +391,7 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: Some(feed),
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
         }
@@ -371,6 +407,7 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: None,
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            compaction_budget: 0,
             spinner: AtomicUsize::new(0),
             thinking: AtomicBool::new(false),
         }
@@ -549,6 +586,12 @@ impl Output {
             self.paint(BOLD, &format!("assistant · turn {turn}"))
         );
         self.at_line_start.store(true, Ordering::Relaxed);
+    }
+
+    /// Record the compaction budget so the footer can show how full the
+    /// context is. Called once when the agent is built.
+    pub fn set_compaction_budget(&mut self, budget: usize) {
+        self.compaction_budget = budget;
     }
 
     /// True when model reasoning is rendered in the transcript.
@@ -743,6 +786,16 @@ impl Output {
             status
         );
         if self.feed().is_some() {
+            // Feed the footer's context gauge and decode speed.
+            if let Some(feed) = self.feed() {
+                if let Ok(mut feed) = feed.lock() {
+                    feed.set_context(
+                        plan.estimated_prompt_tokens,
+                        self.compaction_budget,
+                        usage.decode_tokens_per_second,
+                    );
+                }
+            }
             self.push(FeedEntry::Metrics(line));
             return;
         }

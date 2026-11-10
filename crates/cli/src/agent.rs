@@ -211,10 +211,15 @@ impl Agent {
     pub fn new_session(
         config: Config,
         cwd: PathBuf,
-        output: Output,
+        mut output: Output,
         auto_approve: bool,
         subagent: Option<Arc<dyn SubagentRunner>>,
     ) -> Result<Self> {
+        output.set_compaction_budget(
+            config
+                .cache
+                .autocompact_budget(config.provider.max_context_tokens),
+        );
         let provider = build_provider(&config.provider)?;
         let mode = config.agent.mode;
         let system = system_prompt(mode);
@@ -275,10 +280,15 @@ impl Agent {
     pub fn resume(
         config: Config,
         session_id: String,
-        output: Output,
+        mut output: Output,
         auto_approve: bool,
         subagent: Option<Arc<dyn SubagentRunner>>,
     ) -> Result<Self> {
+        output.set_compaction_budget(
+            config
+                .cache
+                .autocompact_budget(config.provider.max_context_tokens),
+        );
         let provider = build_provider(&config.provider)?;
         let store = SessionStore::default_store();
         let (meta, events) = store.replay(&session_id)?;
@@ -1131,6 +1141,7 @@ mod step_limit {
                     cached_tokens: 80,
                     completion_tokens: 5,
                     reasoning_tokens: 0,
+                    decode_tokens_per_second: None,
                 })),
                 Ok(StreamEvent::Done),
             ];

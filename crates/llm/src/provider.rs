@@ -38,6 +38,9 @@ pub struct Usage {
     /// Tokens served from the provider's prefix cache.
     pub cached_tokens: usize,
     pub reasoning_tokens: usize,
+    /// Decode speed reported by the server (llama.cpp `timings`), in tokens/s.
+    /// `None` when the provider does not report it.
+    pub decode_tokens_per_second: Option<f64>,
 }
 
 impl Usage {

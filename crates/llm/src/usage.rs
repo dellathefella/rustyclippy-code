@@ -28,11 +28,19 @@ pub fn parse_usage(value: &Value) -> Usage {
         .map(|details| number(details.get("reasoning_tokens")))
         .unwrap_or(0);
 
+    // llama.cpp reports decode throughput under `timings`.
+    let decode_tokens_per_second = value
+        .get("timings")
+        .and_then(|timings| timings.get("predicted_per_second"))
+        .and_then(|value| value.as_f64())
+        .filter(|rate| *rate > 0.0);
+
     Usage {
         prompt_tokens,
         completion_tokens,
         cached_tokens: cached_tokens.min(prompt_tokens),
         reasoning_tokens,
+        decode_tokens_per_second,
     }
 }
 
@@ -82,6 +90,30 @@ mod tests {
         });
         let usage = parse_usage(&value);
         assert_eq!(usage.cached_tokens, 768);
+    }
+
+    #[test]
+    fn llama_cpp_decode_speed() {
+        let value = json!({
+            "prompt_tokens": 800,
+            "completion_tokens": 30,
+            "timings": {"cache_n": 768, "predicted_per_second": 42.5}
+        });
+        let usage = parse_usage(&value);
+        assert_eq!(usage.decode_tokens_per_second, Some(42.5));
+    }
+
+    #[test]
+    fn decode_speed_is_none_when_absent_or_zero() {
+        let absent = parse_usage(&json!({"prompt_tokens": 10, "completion_tokens": 2}));
+        assert_eq!(absent.decode_tokens_per_second, None);
+
+        let zero = parse_usage(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "timings": {"predicted_per_second": 0.0}
+        }));
+        assert_eq!(zero.decode_tokens_per_second, None);
     }
 
     #[test]

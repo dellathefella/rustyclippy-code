@@ -37,7 +37,7 @@ const RAIL: Color = Color::Rgb(0x3a, 0x3a, 0x48);
 /// Fixed pane heights, shared by the layout and the scroll math.
 const HEADER_HEIGHT: u16 = 5;
 const INPUT_HEIGHT: u16 = 3;
-const FOOTER_HEIGHT: u16 = 1;
+const FOOTER_HEIGHT: u16 = 2;
 
 /// What the renderer hands back to the caller when the user submits a line.
 pub enum TuiOutcome {
@@ -539,15 +539,19 @@ fn render(frame: &mut ratatui::Frame, state: &FrameState<'_>) {
             };
             (body as u16).saturating_add(2)
         }
-        // One extra row per queued prompt, so the list is never clipped.
-        None => INPUT_HEIGHT.saturating_add(queued.len() as u16),
+        None => INPUT_HEIGHT,
     };
+
+    // Queued prompts get their own pane directly above the prompt box, so they
+    // stack at the bottom of the screen instead of crowding the input line.
+    let queue_height = queued.len() as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(3),
+            Constraint::Length(queue_height),
             Constraint::Length(input_height),
             Constraint::Length(FOOTER_HEIGHT),
         ])
@@ -555,16 +559,35 @@ fn render(frame: &mut ratatui::Frame, state: &FrameState<'_>) {
 
     render_header(frame, chunks[0], header.as_ref(), busy, spinner);
     render_transcript(frame, chunks[1], &entries, scroll);
+    render_queue(frame, chunks[2], queued);
     render_input(
         frame,
-        chunks[2],
+        chunks[3],
         input,
         cursor,
         approval.as_ref(),
         pending_images,
-        queued,
     );
-    render_footer(frame, chunks[3], &totals);
+    render_footer(frame, chunks[4], &totals);
+}
+
+/// Queued prompts, stacked above the prompt box.
+fn render_queue(frame: &mut ratatui::Frame, area: Rect, queued: &[String]) {
+    if queued.is_empty() || area.height == 0 {
+        return;
+    }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (index, prompt) in queued.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled("⏳ ", Style::default().fg(MUTED)),
+            Span::styled(
+                format!("{} ", index + 1),
+                Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+            ),
+            Span::styled(prompt.clone(), Style::default().fg(MUTED)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn render_header(
@@ -811,20 +834,17 @@ fn render_input(
     cursor: usize,
     approval: Option<&crate::ui::ApprovalRequest>,
     pending_images: usize,
-    queued: &[String],
 ) {
     if let Some(request) = approval {
         render_approval(frame, area, request);
         return;
     }
 
-    let mut title = String::from(" prompt ");
-    if pending_images > 0 {
-        title = format!(" prompt · {pending_images} image(s) ");
-    }
-    if !queued.is_empty() {
-        title = format!("{}{} queued ", title.trim_end(), queued.len());
-    }
+    let title = if pending_images > 0 {
+        format!(" prompt · {pending_images} image(s) ")
+    } else {
+        " prompt ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -833,28 +853,18 @@ fn render_input(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Queued prompts sit above the live input line, dimmed so they read as
-    // waiting work rather than something already sent.
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for prompt in queued {
-        lines.push(Line::from(vec![
-            Span::styled("⏳ ", Style::default().fg(MUTED)),
-            Span::styled(prompt.clone(), Style::default().fg(MUTED)),
-        ]));
-    }
-    lines.push(Line::from(vec![
+    let line = Line::from(vec![
         Span::styled("› ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(input.to_string()),
-    ]));
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+    ]);
+    frame.render_widget(Paragraph::new(line), inner);
 
-    // Place the real cursor so the terminal shows the caret. It sits on the
-    // input row, below any queued prompts.
+    // Place the real cursor so the terminal shows the caret.
     let prefix = 2u16;
     let offset = input[..cursor].chars().count() as u16;
     let x = inner.x.saturating_add(prefix).saturating_add(offset);
-    let y = inner.y.saturating_add(queued.len() as u16);
-    if x < inner.x.saturating_add(inner.width) && y < inner.y.saturating_add(inner.height) {
+    let y = inner.y;
+    if x < inner.x.saturating_add(inner.width) {
         frame.set_cursor_position((x, y));
     }
 }
@@ -898,7 +908,8 @@ fn render_approval(frame: &mut ratatui::Frame, area: Rect, request: &crate::ui::
 }
 
 fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Totals) {
-    let line = Line::from(vec![
+    // Row 1: token accounting and decode speed.
+    let mut stats = vec![
         Span::styled(" turns ", Style::default().fg(MUTED)),
         Span::styled(totals.turns.to_string(), Style::default().fg(Color::White)),
         Span::styled("  prompt ", Style::default().fg(MUTED)),
@@ -908,25 +919,55 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Tot
         ),
         Span::styled("  cached ", Style::default().fg(MUTED)),
         Span::styled(
-            format!("{} ({:.1}%)", crate::ui::fmt_num(totals.cached), totals.hit_ratio() * 100.0),
+            format!("{:.1}%", totals.hit_ratio() * 100.0),
             Style::default().fg(TOOL),
-        ),
-        Span::styled("  prefill ", Style::default().fg(MUTED)),
-        Span::styled(
-            crate::ui::fmt_num(totals.prefill),
-            Style::default().fg(Color::White),
         ),
         Span::styled("  out ", Style::default().fg(MUTED)),
         Span::styled(
             crate::ui::fmt_num(totals.completion),
             Style::default().fg(Color::White),
         ),
-        Span::styled(
-            "  ⇥ mode · esc stop · ^C quit",
-            Style::default().fg(MUTED),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    ];
+    if let Some(rate) = totals.decode_tokens_per_second {
+        stats.push(Span::styled("  ", Style::default().fg(MUTED)));
+        stats.push(Span::styled(
+            format!("{rate:.1} tok/s"),
+            Style::default().fg(ACCENT),
+        ));
+    }
+
+    // Row 2: how close the next request is to triggering compaction, plus keys.
+    let mut gauge = Vec::new();
+    if totals.compaction_budget > 0 {
+        let ratio = totals.compaction_ratio();
+        let color = if ratio >= 0.9 {
+            ERR
+        } else if ratio >= 0.75 {
+            WARN
+        } else {
+            TOOL
+        };
+        gauge.push(Span::styled(" ctx ", Style::default().fg(MUTED)));
+        gauge.push(Span::styled(
+            format!(
+                "{} / {} ({:.0}%)",
+                crate::ui::fmt_num(totals.context_tokens),
+                crate::ui::fmt_num(totals.compaction_budget),
+                ratio * 100.0
+            ),
+            Style::default().fg(color),
+        ));
+        gauge.push(Span::styled("  ", Style::default().fg(MUTED)));
+    }
+    gauge.push(Span::styled(
+        "⇥ mode · esc stop · ^C quit",
+        Style::default().fg(MUTED),
+    ));
+
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![Line::from(stats), Line::from(gauge)])),
+        area,
+    );
 }
 
 fn short(id: &str) -> String {
@@ -1346,13 +1387,14 @@ mod tests {
     }
 
     #[test]
-    fn queued_prompts_render_above_the_input() {
+    fn queued_prompts_stack_above_the_input() {
         let feed = Arc::new(Mutex::new(UiFeed::default()));
         let queued = vec![
             "first follow-up".to_string(),
             "second follow-up".to_string(),
         ];
-        let screen = render_to_rows_queued(&feed, "typing", 6, &queued).join("\n");
+        let rows = render_to_rows_queued(&feed, "typing", 6, &queued);
+        let screen = rows.join("\n");
         assert!(
             screen.contains("first follow-up"),
             "queued prompt missing:\n{screen}"
@@ -1361,11 +1403,25 @@ mod tests {
             screen.contains("second follow-up"),
             "queued prompt missing:\n{screen}"
         );
-        assert!(
-            screen.contains("2 queued"),
-            "queue count missing:\n{screen}"
-        );
         assert!(screen.contains("typing"), "live input missing:\n{screen}");
+
+        // The queue pane sits above the prompt box, so both queued lines must
+        // appear on rows before the input line.
+        let input_row = rows
+            .iter()
+            .position(|row| row.contains("typing"))
+            .expect("input row");
+        let first_row = rows
+            .iter()
+            .position(|row| row.contains("first follow-up"))
+            .expect("first queued row");
+        let second_row = rows
+            .iter()
+            .position(|row| row.contains("second follow-up"))
+            .expect("second queued row");
+        assert!(first_row < input_row, "queue must sit above the input");
+        assert!(second_row < input_row, "queue must sit above the input");
+        assert!(first_row < second_row, "queue must keep submission order");
     }
 
     #[test]
@@ -1378,6 +1434,46 @@ mod tests {
         assert_eq!(queue.remove(0), "one");
         assert_eq!(queue.remove(0), "two");
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn footer_shows_context_gauge_and_decode_speed() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        {
+            let mut feed = feed.lock().unwrap();
+            feed.set_context(85_000, 250_000, Some(42.5));
+        }
+        let screen = render_to_rows(&feed, "", 0).join("\n");
+        assert!(screen.contains("ctx"), "context gauge missing:\n{screen}");
+        assert!(
+            screen.contains("85,000"),
+            "context tokens missing:\n{screen}"
+        );
+        assert!(screen.contains("250,000"), "budget missing:\n{screen}");
+        assert!(screen.contains("34%"), "ratio missing:\n{screen}");
+        assert!(
+            screen.contains("42.5 tok/s"),
+            "decode speed missing:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn footer_omits_gauge_and_speed_when_unknown() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        let screen = render_to_rows(&feed, "", 0).join("\n");
+        assert!(!screen.contains("ctx"), "gauge should be hidden:\n{screen}");
+        assert!(!screen.contains("tok/s"), "speed should be hidden:\n{screen}");
+    }
+
+    #[test]
+    fn compaction_ratio_clamps_and_colors_by_pressure() {
+        let mut totals = crate::ui::Totals::default();
+        assert_eq!(totals.compaction_ratio(), 0.0);
+        totals.compaction_budget = 100;
+        totals.context_tokens = 50;
+        assert!((totals.compaction_ratio() - 0.5).abs() < 1e-9);
+        totals.context_tokens = 250;
+        assert_eq!(totals.compaction_ratio(), 1.0, "ratio must clamp to 1.0");
     }
 
     #[test]
