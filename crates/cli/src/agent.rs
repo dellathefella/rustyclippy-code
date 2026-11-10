@@ -543,7 +543,10 @@ impl Agent {
                         text.push_str(&chunk);
                         self.output.text(&chunk);
                     }
-                    StreamEvent::Reasoning(chunk) => reasoning.push_str(&chunk),
+                    StreamEvent::Reasoning(chunk) => {
+                        reasoning.push_str(&chunk);
+                        self.output.reasoning(&chunk);
+                    }
                     StreamEvent::ToolCallDelta {
                         index,
                         id,
@@ -555,6 +558,9 @@ impl Agent {
                 }
             }
 
+            if !reasoning.is_empty() {
+                self.output.reasoning_end();
+            }
             if !text.is_empty() {
                 self.output.line_break();
             }

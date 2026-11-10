@@ -173,12 +173,93 @@ fn utf8_width(first: u8) -> usize {
     }
 }
 
-fn redraw(prompt: &str, buffer: &str, cursor: usize) {
-    print!("\r{prompt}{buffer}\x1b[K");
-    let tail = buffer[cursor..].chars().count();
-    if tail > 0 {
-        print!("\x1b[{tail}D");
+/// Terminal width in columns, for wrap-aware redraws.
+fn terminal_width() -> usize {
+    if let Ok(value) = std::env::var("COLUMNS") {
+        if let Ok(width) = value.parse::<usize>() {
+            if width > 0 {
+                return width;
+            }
+        }
     }
+    #[cfg(unix)]
+    {
+        let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut winsize) } == 0
+            && winsize.ws_col > 0
+        {
+            return winsize.ws_col as usize;
+        }
+    }
+    80
+}
+
+/// Visible width of `text`, ignoring ANSI escape sequences.
+fn display_width(text: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Skip a CSI sequence: ESC [ params... final byte.
+            if chars.next() == Some('[') {
+                for byte in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
+}
+
+/// Where the caret sits after printing `prompt + buffer` from column 0.
+///
+/// Returns `(rows, row, col)`: how many terminal rows the text occupies, and
+/// the zero-based row/column of the caret.
+fn caret_geometry(
+    prompt: &str,
+    buffer: &str,
+    cursor: usize,
+    width: usize,
+) -> (usize, usize, usize) {
+    let width = width.max(1);
+    let before = display_width(prompt) + buffer[..cursor].chars().count();
+    let total = display_width(prompt) + buffer.chars().count();
+    let rows = total.div_ceil(width).max(1);
+    (rows, before / width, before % width)
+}
+
+/// Move the caret to `cursor` assuming `prompt + buffer` was just printed from
+/// column 0 of the current row.
+fn place_cursor(prompt: &str, buffer: &str, cursor: usize) {
+    let (rows, target_row, target_col) = caret_geometry(prompt, buffer, cursor, terminal_width());
+    let end_row = rows - 1;
+    if end_row > target_row {
+        print!("\x1b[{}A", end_row - target_row);
+    }
+    print!("\r");
+    if target_col > 0 {
+        print!("\x1b[{target_col}C");
+    }
+}
+
+/// Repaint the prompt line in place.
+///
+/// A long prompt wraps across several terminal rows, so `\r` alone would leave
+/// the caret on the last row and every keystroke would print a fresh line.
+/// Walk back to the first row of the prompt and clear everything below it.
+fn redraw(prompt: &str, buffer: &str, cursor: usize) {
+    let (rows, _, _) = caret_geometry(prompt, buffer, cursor, terminal_width());
+    print!("\r");
+    if rows > 1 {
+        print!("\x1b[{}A", rows - 1);
+    }
+    print!("\x1b[J");
+    print!("{prompt}{buffer}");
+    place_cursor(prompt, buffer, cursor);
     io::stdout().flush().ok();
 }
 
@@ -262,10 +343,7 @@ fn paste_clipboard(
         }
     }
     print!("{prompt}{buffer}");
-    let tail = buffer[cursor..].chars().count();
-    if tail > 0 {
-        print!("\x1b[{tail}D");
-    }
+    place_cursor(prompt, buffer, cursor);
     io::stdout().flush().ok();
     Ok(())
 }
@@ -429,5 +507,31 @@ mod tests {
         insert_char(&mut buffer, &mut cursor, 'b');
         assert_eq!(buffer, "abc");
         assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn display_width_ignores_ansi() {
+        assert_eq!(display_width("\x1b[1m\x1b[36m›\x1b[0m "), 2);
+        assert_eq!(display_width("plain"), 5);
+    }
+
+    #[test]
+    fn caret_geometry_tracks_wrapped_rows() {
+        // Prompt "› " is 2 columns wide; 10 chars of buffer at width 10 wraps.
+        let (rows, row, col) = caret_geometry("› ", "abcdefghij", 10, 10);
+        assert_eq!(rows, 2);
+        assert_eq!((row, col), (1, 2));
+
+        // Caret at the start sits on the first row.
+        let (rows, row, col) = caret_geometry("› ", "abcdefghij", 0, 10);
+        assert_eq!(rows, 2);
+        assert_eq!((row, col), (0, 2));
+    }
+
+    #[test]
+    fn caret_geometry_handles_empty_buffer() {
+        let (rows, row, col) = caret_geometry("› ", "", 0, 80);
+        assert_eq!(rows, 1);
+        assert_eq!((row, col), (0, 2));
     }
 }

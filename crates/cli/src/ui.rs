@@ -27,6 +27,9 @@ pub enum FeedEntry {
     User(String),
     /// Assistant text, streamed in chunks.
     Text(String),
+    /// Model reasoning ("thinking"), streamed in chunks. Only emitted when the
+    /// user has enabled thinking output.
+    Reasoning(String),
     /// A tool invocation line.
     ToolCall { name: String, detail: String },
     /// A tool result line.
@@ -215,6 +218,9 @@ pub struct Output {
     at_line_start: AtomicBool,
     /// When set, output is collected for a TUI instead of printed.
     feed: Option<Arc<Mutex<UiFeed>>>,
+    /// Render model reasoning ("thinking") in the transcript. Shared across
+    /// clones so `/thinking` toggles every surface at once.
+    show_reasoning: Arc<AtomicBool>,
 }
 
 impl Clone for Output {
@@ -226,6 +232,7 @@ impl Clone for Output {
             interactive: self.interactive,
             at_line_start: AtomicBool::new(self.at_line_start.load(Ordering::Relaxed)),
             feed: self.feed.clone(),
+            show_reasoning: self.show_reasoning.clone(),
         }
     }
 }
@@ -242,6 +249,7 @@ impl Output {
             interactive: false,
             at_line_start: AtomicBool::new(true),
             feed: None,
+            show_reasoning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -255,6 +263,7 @@ impl Output {
             interactive: color,
             at_line_start: AtomicBool::new(true),
             feed: None,
+            show_reasoning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -267,6 +276,7 @@ impl Output {
             interactive: false,
             at_line_start: AtomicBool::new(true),
             feed: Some(feed),
+            show_reasoning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -279,6 +289,7 @@ impl Output {
             interactive: false,
             at_line_start: AtomicBool::new(true),
             feed: None,
+            show_reasoning: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -438,6 +449,56 @@ impl Output {
             self.paint(CYAN, "▌"),
             self.paint(BOLD, &format!("assistant · turn {turn}"))
         );
+        self.at_line_start.store(true, Ordering::Relaxed);
+    }
+
+    /// True when model reasoning is rendered in the transcript.
+    pub fn show_reasoning(&self) -> bool {
+        self.show_reasoning.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable reasoning rendering. Returns the new state.
+    pub fn set_show_reasoning(&self, enabled: bool) -> bool {
+        self.show_reasoning.store(enabled, Ordering::Relaxed);
+        enabled
+    }
+
+    /// Stream model reasoning ("thinking"). Rendered dimmed under a `⋯` rail so
+    /// it reads as scratch work rather than the answer.
+    pub fn reasoning(&self, chunk: &str) {
+        if self.silent() || !self.show_reasoning() {
+            return;
+        }
+        if self.feed().is_some() {
+            self.push(FeedEntry::Reasoning(chunk.to_string()));
+            return;
+        }
+        if !self.interactive {
+            eprintln!("{chunk}");
+            return;
+        }
+        for ch in chunk.chars() {
+            if self.at_line_start.load(Ordering::Relaxed) && ch != '\n' {
+                print!("{}", self.paint(DIM, "⋯ "));
+                self.at_line_start.store(false, Ordering::Relaxed);
+            }
+            print!("{}", self.paint(DIM, &ch.to_string()));
+            if ch == '\n' {
+                self.at_line_start.store(true, Ordering::Relaxed);
+            }
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Finish a streamed reasoning block with a newline.
+    pub fn reasoning_end(&self) {
+        if self.silent() || !self.show_reasoning() {
+            return;
+        }
+        if self.feed().is_some() {
+            return;
+        }
+        println!();
         self.at_line_start.store(true, Ordering::Relaxed);
     }
 

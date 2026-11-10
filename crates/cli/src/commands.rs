@@ -114,7 +114,7 @@ pub async fn chat(
 
     print_header(&agent);
     agent.output.hint(
-        "Ctrl+V pastes a clipboard image · /exit /session /cache /stats /new /mode build|plan /paste /image <path> /clear-images /help",
+        "Ctrl+V pastes a clipboard image · /exit /session /cache /stats /new /mode build|plan /thinking /paste /image <path> /clear-images /help",
     );
 
     let context = ChatContext {
@@ -189,7 +189,7 @@ pub async fn tui(
 
     print_header(&agent);
     agent.output.hint(
-        "Ctrl+C quits · /exit /session /cache /stats /new /mode build|plan /paste /image <path> /clear-images /help",
+        "Ctrl+C quits · /exit /session /cache /stats /new /mode build|plan /thinking /paste /image <path> /clear-images /help",
     );
 
     let mut tui = crate::tui::Tui::enter(feed.clone())?;
@@ -210,7 +210,10 @@ async fn run_tui_loop(
     let mut pending_images: Vec<ImageAttachment> = Vec::new();
 
     loop {
-        tui.draw()?;
+        // Images captured inside the TUI (Ctrl+V / empty paste) join the list
+        // the loop owns, so `/images` and `/clear-images` see them too.
+        pending_images.extend(tui.take_images());
+        tui.draw(pending_images.len())?;
         if !tui.poll(std::time::Duration::from_millis(50))? {
             continue;
         }
@@ -267,7 +270,9 @@ async fn run_turn_task(
         tokio::select! {
             result = &mut future => return result,
             _ = ticker.tick() => {
-                tui.draw()?;
+                // Images are drained before the turn starts, so nothing is
+                // pending while it runs.
+                tui.draw(0)?;
                 // Drain keys so approvals can be answered mid-turn.
                 while tui.poll(std::time::Duration::from_millis(0))? {}
             }
@@ -342,6 +347,7 @@ fn handle_command(
                  /stats         lifetime token usage for this project\n\
                  /new           start a fresh session\n\
                  /mode [build|plan]  show or switch agent mode\n\
+                 /thinking [on|off] show or toggle model reasoning output\n\
                  /paste         attach the clipboard image to the next prompt\n\
                  /image <path>  attach an image file to the next prompt\n\
                  /images        list pending attachments\n\
@@ -445,6 +451,25 @@ fn handle_command(
         "/clear-images" => {
             pending_images.clear();
             agent.output.hint("cleared pending images");
+            Ok(CommandOutcome::Continue)
+        }
+        "/thinking" => {
+            let enabled = match rest.to_lowercase().as_str() {
+                "" => !agent.output.show_reasoning(),
+                "on" | "true" | "yes" | "1" => true,
+                "off" | "false" | "no" | "0" => false,
+                other => {
+                    agent.output.error(&format!(
+                        "unknown /thinking value `{other}` (use on or off)"
+                    ));
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            agent.output.set_show_reasoning(enabled);
+            agent.output.hint(&format!(
+                "thinking output {}",
+                if enabled { "on" } else { "off" }
+            ));
             Ok(CommandOutcome::Continue)
         }
         "/clear" => {

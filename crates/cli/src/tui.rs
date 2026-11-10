@@ -10,7 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -53,6 +56,8 @@ pub struct Tui {
     dirty: bool,
     /// Set when the user pressed Enter; the caller drains it.
     submitted: Option<String>,
+    /// Images attached to the next prompt.
+    pending_images: Vec<rustyclippy_core::ImageAttachment>,
     quit: bool,
 }
 
@@ -61,7 +66,8 @@ impl Tui {
     pub fn enter(feed: Arc<Mutex<UiFeed>>) -> Result<Self> {
         enable_raw_mode().context("enabling raw terminal mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).context("entering alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+            .context("entering alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).context("creating terminal")?;
         Ok(Self {
@@ -73,6 +79,7 @@ impl Tui {
             last_revision: u64::MAX,
             dirty: true,
             submitted: None,
+            pending_images: Vec::new(),
             quit: false,
         })
     }
@@ -80,13 +87,20 @@ impl Tui {
     /// Restore the terminal. Safe to call twice.
     pub fn leave(&mut self) -> Result<()> {
         disable_raw_mode().ok();
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen).ok();
+        execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )
+        .ok();
         self.terminal.show_cursor().ok();
         Ok(())
     }
 
-    /// Draw one frame if the feed changed.
-    pub fn draw(&mut self) -> Result<()> {
+    /// Draw one frame if the feed changed. `pending_images` is the count the
+    /// caller holds for the next prompt (the TUI hands captured images over on
+    /// submit, so the loop owns the authoritative list).
+    pub fn draw(&mut self, pending_images: usize) -> Result<()> {
         let revision = self.feed.lock().map(|feed| feed.revision()).unwrap_or(0);
         if revision == self.last_revision && !self.dirty {
             return Ok(());
@@ -98,7 +112,7 @@ impl Tui {
         let cursor = self.cursor;
         let scroll = self.scroll;
         self.terminal
-            .draw(|frame| render(frame, &feed, &input, cursor, scroll))
+            .draw(|frame| render(frame, &feed, &input, cursor, scroll, pending_images))
             .context("drawing frame")?;
         Ok(())
     }
@@ -109,8 +123,15 @@ impl Tui {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
             Event::Paste(text) => {
-                self.input.insert_str(self.cursor, &text.replace(['\r', '\n'], " "));
-                self.cursor += text.len();
+                // An empty bracketed paste means the clipboard held an image,
+                // not text: attach it instead of inserting nothing.
+                if text.trim().is_empty() {
+                    self.attach_clipboard_image();
+                } else {
+                    self.input
+                        .insert_str(self.cursor, &text.replace(['\r', '\n'], " "));
+                    self.cursor += text.len();
+                }
                 self.dirty = true;
                 Ok(None)
             }
@@ -146,6 +167,11 @@ impl Tui {
                 } else {
                     Ok(None)
                 }
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.attach_clipboard_image();
+                self.dirty = true;
+                Ok(None)
             }
             KeyCode::Char(ch) => {
                 self.input.insert(self.cursor, ch);
@@ -234,6 +260,45 @@ impl Tui {
         }
     }
 
+    /// Capture the clipboard image and attach it to the next prompt.
+    fn attach_clipboard_image(&mut self) {
+        match crate::images::capture_clipboard() {
+            Ok(Some(image)) => {
+                let mime = image.mime.clone();
+                self.pending_images.push(image);
+                if let Ok(mut feed) = self.feed.lock() {
+                    feed.push(FeedEntry::Image(format!(
+                        "image attached · {} · {} pending",
+                        mime,
+                        self.pending_images.len()
+                    )));
+                }
+            }
+            Ok(None) => {
+                if let Ok(mut feed) = self.feed.lock() {
+                    feed.push(FeedEntry::Notice {
+                        level: NoticeLevel::Warning,
+                        text: "clipboard has no image (copy a screenshot or image first)"
+                            .to_string(),
+                    });
+                }
+            }
+            Err(error) => {
+                if let Ok(mut feed) = self.feed.lock() {
+                    feed.push(FeedEntry::Notice {
+                        level: NoticeLevel::Error,
+                        text: format!("clipboard capture failed: {error:#}"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Drain images attached to the prompt being submitted.
+    pub fn take_images(&mut self) -> Vec<rustyclippy_core::ImageAttachment> {
+        std::mem::take(&mut self.pending_images)
+    }
+
     fn pending_approval(&self) -> bool {
         self.feed
             .lock()
@@ -277,7 +342,14 @@ impl Tui {
     }
 }
 
-fn render(frame: &mut ratatui::Frame, feed: &Arc<Mutex<UiFeed>>, input: &str, cursor: usize, scroll: usize) {
+fn render(
+    frame: &mut ratatui::Frame,
+    feed: &Arc<Mutex<UiFeed>>,
+    input: &str,
+    cursor: usize,
+    scroll: usize,
+    pending_images: usize,
+) {
     let area = frame.area();
 
     let (header, entries, approval, busy, totals) = match feed.lock() {
@@ -317,7 +389,14 @@ fn render(frame: &mut ratatui::Frame, feed: &Arc<Mutex<UiFeed>>, input: &str, cu
 
     render_header(frame, chunks[0], header.as_ref(), busy);
     render_transcript(frame, chunks[1], &entries, scroll);
-    render_input(frame, chunks[2], input, cursor, approval.as_ref());
+    render_input(
+        frame,
+        chunks[2],
+        input,
+        cursor,
+        approval.as_ref(),
+        pending_images,
+    );
     render_footer(frame, chunks[3], &totals);
 }
 
@@ -475,6 +554,20 @@ fn transcript_lines(entries: &[FeedEntry]) -> Vec<Line<'static>> {
                     }
                 }
             }
+            FeedEntry::Reasoning(chunk) => {
+                // Dimmed scratch work under a `⋯` rail, distinct from the answer.
+                for piece in chunk.split_inclusive('\n') {
+                    let body = piece.trim_end_matches('\n');
+                    if body.is_empty() {
+                        lines.push(Line::from(Span::styled("⋯", Style::default().fg(MUTED))));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled("⋯ ", Style::default().fg(MUTED)),
+                            Span::styled(body.to_string(), Style::default().fg(MUTED)),
+                        ]));
+                    }
+                }
+            }
             FeedEntry::ToolCall { name, detail } => {
                 lines.push(Line::from(vec![
                     Span::styled("  ● ", Style::default().fg(TOOL)),
@@ -548,6 +641,7 @@ fn render_input(
     input: &str,
     cursor: usize,
     approval: Option<&crate::ui::ApprovalRequest>,
+    pending_images: usize,
 ) {
     if let Some(request) = approval {
         render_approval(frame, area, request);
@@ -558,7 +652,14 @@ fn render_input(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
-        .title(Span::styled(" prompt ", Style::default().fg(ACCENT)));
+        .title(Span::styled(
+            if pending_images > 0 {
+                format!(" prompt · {pending_images} image(s) ")
+            } else {
+                " prompt ".to_string()
+            },
+            Style::default().fg(ACCENT),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -640,7 +741,10 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, totals: &crate::ui::Tot
             crate::ui::fmt_num(totals.completion),
             Style::default().fg(Color::White),
         ),
-        Span::styled("  ↑↓ scroll · ^C quit", Style::default().fg(MUTED)),
+        Span::styled(
+            "  ↑↓ scroll · ^V image · ^C quit",
+            Style::default().fg(MUTED),
+        ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -692,7 +796,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, feed, input, cursor, 0))
+            .draw(|frame| render(frame, feed, input, cursor, 0, 0))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -702,6 +806,53 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn transcript_renders_reasoning_dimmed() {
+        let entries = vec![FeedEntry::Reasoning("weighing options\n".into())];
+        let lines = transcript_lines(&entries);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].to_string().contains("weighing options"));
+        assert!(lines[0].to_string().starts_with("⋯"));
+    }
+
+    #[test]
+    fn reasoning_is_hidden_until_enabled() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        let output = crate::ui::Output::tui(feed.clone());
+        output.reasoning("secret thoughts");
+        assert!(feed.lock().unwrap().entries().is_empty());
+
+        assert!(output.set_show_reasoning(true));
+        output.reasoning("secret thoughts");
+        let entries = feed.lock().unwrap().entries().to_vec();
+        assert!(matches!(entries.as_slice(), [FeedEntry::Reasoning(_)]));
+    }
+
+    #[test]
+    fn prompt_title_shows_pending_images() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &feed, "", 0, 0, 2))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("2 image(s)"),
+            "pending images missing:\n{screen}"
+        );
     }
 
     #[test]
