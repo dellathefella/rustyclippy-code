@@ -58,6 +58,8 @@ pub struct Tui {
     submitted: Option<String>,
     /// Images attached to the next prompt.
     pending_images: Vec<rustyclippy_core::ImageAttachment>,
+    /// Spinner frame, advanced on every draw while a turn is in flight.
+    spinner: usize,
     quit: bool,
 }
 
@@ -80,6 +82,7 @@ impl Tui {
             dirty: true,
             submitted: None,
             pending_images: Vec::new(),
+            spinner: 0,
             quit: false,
         })
     }
@@ -102,7 +105,13 @@ impl Tui {
     /// submit, so the loop owns the authoritative list).
     pub fn draw(&mut self, pending_images: usize) -> Result<()> {
         let revision = self.feed.lock().map(|feed| feed.revision()).unwrap_or(0);
-        if revision == self.last_revision && !self.dirty {
+        let busy = self.feed.lock().map(|feed| feed.busy()).unwrap_or(false);
+        // While a turn runs, advance the spinner and repaint even when the feed
+        // is unchanged, so the header visibly animates instead of freezing.
+        if busy {
+            self.spinner = self.spinner.wrapping_add(1);
+        }
+        if revision == self.last_revision && !self.dirty && !busy {
             return Ok(());
         }
         self.last_revision = revision;
@@ -111,8 +120,19 @@ impl Tui {
         let input = self.input.clone();
         let cursor = self.cursor;
         let scroll = self.scroll;
+        let spinner = self.spinner;
         self.terminal
-            .draw(|frame| render(frame, &feed, &input, cursor, scroll, pending_images))
+            .draw(|frame| {
+                render(
+                    frame,
+                    &feed,
+                    &input,
+                    cursor,
+                    scroll,
+                    pending_images,
+                    spinner,
+                )
+            })
             .context("drawing frame")?;
         Ok(())
     }
@@ -349,6 +369,7 @@ fn render(
     cursor: usize,
     scroll: usize,
     pending_images: usize,
+    spinner: usize,
 ) {
     let area = frame.area();
 
@@ -387,7 +408,7 @@ fn render(
         ])
         .split(area);
 
-    render_header(frame, chunks[0], header.as_ref(), busy);
+    render_header(frame, chunks[0], header.as_ref(), busy, spinner);
     render_transcript(frame, chunks[1], &entries, scroll);
     render_input(
         frame,
@@ -405,6 +426,7 @@ fn render_header(
     area: Rect,
     header: Option<&crate::ui::HeaderInfo>,
     busy: bool,
+    spinner: usize,
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -425,7 +447,8 @@ fn render_header(
     };
 
     let status = if busy {
-        Span::styled("● working", Style::default().fg(WARN))
+        let glyph = crate::ui::SPINNER[spinner % crate::ui::SPINNER.len()];
+        Span::styled(format!("{glyph} working"), Style::default().fg(WARN))
     } else {
         Span::styled("● idle", Style::default().fg(MUTED))
     };
@@ -796,7 +819,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, feed, input, cursor, 0, 0))
+            .draw(|frame| render(frame, feed, input, cursor, 0, 0, 0))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -833,6 +856,47 @@ mod tests {
     }
 
     #[test]
+    fn header_spinner_animates_while_busy() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        {
+            let mut feed = feed.lock().unwrap();
+            feed.set_header(crate::ui::HeaderInfo {
+                version: "0.1.0".into(),
+                session: "sess".into(),
+                model: "m".into(),
+                mode: "build".into(),
+                base_url: "http://x".into(),
+                cwd: "/tmp".into(),
+            });
+            feed.set_busy(true);
+        }
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut frames = Vec::new();
+        for spinner in 0..3 {
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render(frame, &feed, "", 0, 0, 0, spinner))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            frames.push(
+                (0..buffer.area.height)
+                    .map(|y| {
+                        (0..buffer.area.width)
+                            .map(|x| buffer[(x, y)].symbol().to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        assert!(frames[0].contains("working"), "busy status missing:\n{}", frames[0]);
+        assert_ne!(frames[0], frames[1], "spinner frame did not advance");
+        assert_ne!(frames[1], frames[2], "spinner frame did not advance");
+    }
+
+    #[test]
     fn prompt_title_shows_pending_images() {
         let feed = Arc::new(Mutex::new(UiFeed::default()));
         use ratatui::backend::TestBackend;
@@ -840,7 +904,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &feed, "", 0, 0, 2))
+            .draw(|frame| render(frame, &feed, "", 0, 0, 2, 0))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let screen: String = (0..buffer.area.height)

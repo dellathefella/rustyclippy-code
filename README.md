@@ -63,11 +63,12 @@ stdout, so piped output stays clean.
 › explain the cache guard
 ──────────────────────────────────────────────────────────────
 ▌ assistant · turn 1
+⠹ the guard hashes every message before each request, so a rewritten
+⠸ prefix is caught before it reaches the server…
 │ The cache guard hashes every message before each request…
 │
-  ● read  {"path":"crates/core/src/cache.rs"}
-  └ fn guard(&self, plan: &RequestPlan) -> Result<()> {
-  · turn 1 step 1 · prompt=2,340 cached=2,274 (97.2%) prefill=66 out=56 · prefix reused ✓
+  ● read crates/core/src/cache.rs
+  └ exit 0 · fn guard(&self, plan: &RequestPlan) -> Result<()> {
 ── turn 1 · 1 steps · prompt=2,340 cached=2,274 (97.2%) prefill=66 out=56 ──
 ```
 
@@ -80,7 +81,8 @@ Slash commands:
 /stats         lifetime token usage for this project
 /new           start a fresh session
 /mode [build|plan]  show or switch agent mode
-/thinking [on|off]  toggle model reasoning output (on by default)
+/thinking [on|off]  toggle model reasoning output (on by default; the
+               spinner animates while the model thinks)
 /paste         attach the clipboard image to the next prompt
 /image <path>  attach an image file to the next prompt
 /images        list pending attachments

@@ -5,7 +5,7 @@
 //! rendered under a dim rail so the prompt and the answer never blur together.
 
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rustyclippy_core::{CompactionRecord, RequestPlan};
@@ -19,6 +19,54 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const BOLD: &str = "\x1b[1m";
+/// Hide the caret while a spinner repaints in place.
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+
+/// Braille frames for the thinking spinner.
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Human-readable one-line summary of a tool call's arguments.
+///
+/// Raw JSON is unreadable in a transcript (`edit {"new_string":"..."`), so each
+/// tool reports the argument that actually identifies the work: the command for
+/// `bash`, the path for file tools, the query for search, and so on.
+pub fn tool_detail(name: &str, args: &serde_json::Value) -> String {
+    let text = |key: &str| {
+        args.get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let detail = match name {
+        "bash" | "loop" => text("command"),
+        "read" | "write" | "edit" | "list" => text("path"),
+        "glob" | "grep" => {
+            let pattern = text("pattern");
+            let path = text("path");
+            if path.is_empty() {
+                pattern
+            } else {
+                format!("{pattern} in {path}")
+            }
+        }
+        "websearch" => text("query"),
+        "webfetch" => text("url"),
+        "task" => text("description"),
+        "wait" => text("task_id"),
+        "question" => text("question"),
+        "todo" => {
+            let count = args
+                .get("todos")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len())
+                .unwrap_or(0);
+            format!("{count} item(s)")
+        }
+        _ => String::new(),
+    };
+    truncate(&detail, 120)
+}
 
 /// One transcript row produced by the agent, consumed by the TUI renderer.
 #[derive(Debug, Clone)]
@@ -221,6 +269,11 @@ pub struct Output {
     /// Render model reasoning ("thinking") in the transcript. On by default;
     /// shared across clones so `/thinking` toggles every surface at once.
     show_reasoning: Arc<AtomicBool>,
+    /// Spinner frame counter for the animated thinking indicator.
+    spinner: AtomicUsize,
+    /// True while a reasoning block is streaming, so the spinner can be
+    /// repainted in place instead of printing a new line per chunk.
+    thinking: AtomicBool,
 }
 
 impl Clone for Output {
@@ -233,6 +286,8 @@ impl Clone for Output {
             at_line_start: AtomicBool::new(self.at_line_start.load(Ordering::Relaxed)),
             feed: self.feed.clone(),
             show_reasoning: self.show_reasoning.clone(),
+            spinner: AtomicUsize::new(self.spinner.load(Ordering::Relaxed)),
+            thinking: AtomicBool::new(self.thinking.load(Ordering::Relaxed)),
         }
     }
 }
@@ -250,6 +305,8 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: None,
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            spinner: AtomicUsize::new(0),
+            thinking: AtomicBool::new(false),
         }
     }
 
@@ -264,6 +321,8 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: None,
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            spinner: AtomicUsize::new(0),
+            thinking: AtomicBool::new(false),
         }
     }
 
@@ -277,6 +336,8 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: Some(feed),
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            spinner: AtomicUsize::new(0),
+            thinking: AtomicBool::new(false),
         }
     }
 
@@ -290,6 +351,8 @@ impl Output {
             at_line_start: AtomicBool::new(true),
             feed: None,
             show_reasoning: Arc::new(AtomicBool::new(true)),
+            spinner: AtomicUsize::new(0),
+            thinking: AtomicBool::new(false),
         }
     }
 
@@ -465,6 +528,11 @@ impl Output {
 
     /// Stream model reasoning ("thinking"). Rendered dimmed under a `⋯` rail so
     /// it reads as scratch work rather than the answer.
+    ///
+    /// In chat mode the first chunk paints a spinner that advances on every
+    /// chunk, so the block visibly "thinks" instead of appearing as a wall of
+    /// text. The spinner is repainted in place with `\r` and cleared once the
+    /// reasoning ends.
     pub fn reasoning(&self, chunk: &str) {
         if self.silent() || !self.show_reasoning() {
             return;
@@ -477,9 +545,15 @@ impl Output {
             eprintln!("{chunk}");
             return;
         }
+        let frame = self.spinner.fetch_add(1, Ordering::Relaxed) % SPINNER.len();
+        let glyph = SPINNER[frame];
+        // Hide the caret so the spinner glyph does not flicker against it.
+        if !self.thinking.load(Ordering::Relaxed) {
+            print!("{HIDE_CURSOR}");
+        }
         for ch in chunk.chars() {
             if self.at_line_start.load(Ordering::Relaxed) && ch != '\n' {
-                print!("{}", self.paint(DIM, "⋯ "));
+                print!("{}", self.paint(DIM, &format!("{glyph} ")));
                 self.at_line_start.store(false, Ordering::Relaxed);
             }
             print!("{}", self.paint(DIM, &ch.to_string()));
@@ -487,10 +561,11 @@ impl Output {
                 self.at_line_start.store(true, Ordering::Relaxed);
             }
         }
+        self.thinking.store(true, Ordering::Relaxed);
         let _ = std::io::stdout().flush();
     }
 
-    /// Finish a streamed reasoning block with a newline.
+    /// Finish a streamed reasoning block: clear the spinner line and reset.
     pub fn reasoning_end(&self) {
         if self.silent() || !self.show_reasoning() {
             return;
@@ -498,8 +573,14 @@ impl Output {
         if self.feed().is_some() {
             return;
         }
+        if self.thinking.swap(false, Ordering::Relaxed) {
+            // The spinner glyph sits at the start of the current line; erase it
+            // so the answer below starts clean, then restore the caret.
+            print!("\r\x1b[K{SHOW_CURSOR}");
+        }
         println!();
         self.at_line_start.store(true, Ordering::Relaxed);
+        let _ = std::io::stdout().flush();
     }
 
     /// Stream model text. In chat mode every line is prefixed with a dim rail.
@@ -545,8 +626,7 @@ impl Output {
         if self.silent() {
             return;
         }
-        let detail = serde_json::to_string(arguments).unwrap_or_default();
-        let detail = truncate(&detail, 200);
+        let detail = tool_detail(name, arguments);
         if self.feed().is_some() {
             self.push(FeedEntry::ToolCall {
                 name: name.to_string(),
@@ -566,16 +646,12 @@ impl Output {
         if self.silent() {
             return;
         }
-        let first_line = result
-            .content
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("(no output)");
+        let summary = tool_result_summary(result);
         if self.feed().is_some() {
             self.push(FeedEntry::ToolResult {
                 name: name.to_string(),
                 ok: result.ok,
-                detail: truncate(first_line, 160),
+                detail: summary,
             });
             return;
         }
@@ -584,12 +660,7 @@ impl Output {
         } else {
             self.paint(RED, "└")
         };
-        eprintln!(
-            "  {} {} {}",
-            marker,
-            self.paint(DIM, name),
-            truncate(first_line, 160)
-        );
+        eprintln!("  {} {} {}", marker, self.paint(DIM, name), summary);
     }
 
     /// Per-request cache accounting.
@@ -637,6 +708,12 @@ impl Output {
         );
         if self.feed().is_some() {
             self.push(FeedEntry::Metrics(line));
+            return;
+        }
+        // Chat mode stays quiet: a healthy cache hit is the normal case, and a
+        // per-step accounting line for every step buries the conversation. Only
+        // surface the states worth noticing; `run` keeps the full line.
+        if self.interactive && cached > 0 && plan.stable {
             return;
         }
         eprintln!(
@@ -798,6 +875,47 @@ impl Output {
     }
 }
 
+/// Compact one-line summary of a tool result.
+///
+/// Shell output arrives as `exit_code: N\n--- stdout ---\n...`, which reads as
+/// noise in a transcript. Report the exit status and the first meaningful line
+/// instead, and collapse empty output to a short marker.
+pub fn tool_result_summary(result: &ToolResult) -> String {
+    let content = result.content.trim();
+    if content.is_empty() {
+        return if result.ok {
+            "ok".to_string()
+        } else {
+            "failed".to_string()
+        };
+    }
+    // `bash`/`loop` prefix their output with an exit code and section headers.
+    if let Some(rest) = content.strip_prefix("exit_code: ") {
+        let mut lines = rest.lines();
+        let code = lines.next().unwrap_or("?").trim();
+        let body = lines
+            .find(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with("---")
+            })
+            .unwrap_or("");
+        let status = if code == "0" {
+            format!("exit {code}")
+        } else {
+            format!("exit {code} ✗")
+        };
+        if body.is_empty() {
+            return status;
+        }
+        return format!("{status} · {}", truncate(body.trim(), 120));
+    }
+    let first = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("(no output)");
+    truncate(first.trim(), 120)
+}
+
 pub fn fmt_num(value: usize) -> String {
     let digits = value.to_string();
     let mut out = String::new();
@@ -843,6 +961,54 @@ mod tests {
         assert_eq!(fmt_num(999), "999");
         assert_eq!(fmt_num(1000), "1,000");
         assert_eq!(fmt_num(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn tool_detail_is_human_readable() {
+        let edit = serde_json::json!({
+            "path": "src/main.rs",
+            "old_string": "a",
+            "new_string": "b"
+        });
+        assert_eq!(tool_detail("edit", &edit), "src/main.rs");
+
+        let bash = serde_json::json!({ "command": "cargo test" });
+        assert_eq!(tool_detail("bash", &bash), "cargo test");
+
+        let grep = serde_json::json!({ "pattern": "fn main", "path": "src" });
+        assert_eq!(tool_detail("grep", &grep), "fn main in src");
+
+        let glob = serde_json::json!({ "pattern": "**/*.rs" });
+        assert_eq!(tool_detail("glob", &glob), "**/*.rs");
+
+        let todo = serde_json::json!({ "todos": [{"content": "a", "status": "pending"}] });
+        assert_eq!(tool_detail("todo", &todo), "1 item(s)");
+    }
+
+    #[test]
+    fn tool_detail_never_dumps_raw_json() {
+        let edit = serde_json::json!({ "path": "a.rs", "new_string": "x".repeat(400) });
+        let detail = tool_detail("edit", &edit);
+        assert!(!detail.contains("new_string"), "raw JSON leaked: {detail}");
+        assert!(detail.chars().count() <= 121);
+    }
+
+    #[test]
+    fn tool_result_summary_collapses_shell_output() {
+        let ok = ToolResult::success("exit_code: 0\n--- stdout ---\nsrc\n--- stderr ---\n");
+        assert_eq!(tool_result_summary(&ok), "exit 0 · src");
+
+        let failed = ToolResult::success("exit_code: 3\n--- stdout ---\n--- stderr ---\n");
+        assert_eq!(tool_result_summary(&failed), "exit 3 ✗");
+
+        let empty = ToolResult::success("");
+        assert_eq!(tool_result_summary(&empty), "ok");
+    }
+
+    #[test]
+    fn tool_result_summary_keeps_first_line_for_other_tools() {
+        let read = ToolResult::success("\n\nfn main() {}\nmore");
+        assert_eq!(tool_result_summary(&read), "fn main() {}");
     }
 
     #[test]

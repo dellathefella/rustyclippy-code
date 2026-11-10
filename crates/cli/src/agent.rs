@@ -21,7 +21,7 @@ use rustyclippy_llm::{build_provider, LlmRequest, Provider, StreamEvent, Usage};
 use rustyclippy_tools::{SubagentRunner, ToolContext, ToolRegistry, ToolResult};
 use serde_json::Value;
 
-use crate::ui::{fmt_num, truncate, ApprovalAnswer, ApprovalRequest, Output};
+use crate::ui::{fmt_num, tool_detail, ApprovalAnswer, ApprovalRequest, Output};
 
 #[derive(Default)]
 struct PendingCall {
@@ -203,25 +203,7 @@ fn is_read_only_command(command: &str) -> bool {
 }
 
 fn describe_args(name: &str, args: &Value) -> String {
-    let detail = match name {
-        "bash" | "loop" => args
-            .get("command")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "edit" | "write" => args
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "task" => args
-            .get("description")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_string(),
-        _ => String::new(),
-    };
-    truncate(&detail, 120)
+    tool_detail(name, args)
 }
 
 impl Agent {
