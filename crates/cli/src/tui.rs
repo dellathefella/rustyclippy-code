@@ -34,6 +34,11 @@ const ERR: Color = Color::Rgb(0xff, 0x6b, 0x6b);
 const MUTED: Color = Color::Rgb(0x6b, 0x6b, 0x7b);
 const RAIL: Color = Color::Rgb(0x3a, 0x3a, 0x48);
 
+/// Fixed pane heights, shared by the layout and the scroll math.
+const HEADER_HEIGHT: u16 = 5;
+const INPUT_HEIGHT: u16 = 3;
+const FOOTER_HEIGHT: u16 = 1;
+
 /// What the renderer hands back to the caller when the user submits a line.
 pub enum TuiOutcome {
     /// A prompt was submitted; drain it with [`Tui::take_submitted`].
@@ -268,12 +273,24 @@ impl Tui {
                 Ok(None)
             }
             KeyCode::Home => {
-                self.cursor = 0;
+                // Jump to the oldest lines when the prompt box is empty; move
+                // the caret to the start of the line while composing.
+                if self.input.is_empty() {
+                    self.scroll = self.max_scroll();
+                } else {
+                    self.cursor = 0;
+                }
                 self.dirty = true;
                 Ok(None)
             }
             KeyCode::End => {
-                self.cursor = self.input.len();
+                // Jump back to the newest lines when the prompt box is empty;
+                // move the caret to the end of the line while composing.
+                if self.input.is_empty() {
+                    self.scroll = 0;
+                } else {
+                    self.cursor = self.input.len();
+                }
                 self.dirty = true;
                 Ok(None)
             }
@@ -286,7 +303,7 @@ impl Tui {
                 Ok(None)
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll = self.scroll.saturating_add(10).min(self.max_scroll());
                 self.dirty = true;
                 Ok(None)
             }
@@ -351,6 +368,31 @@ impl Tui {
         std::mem::take(&mut self.pending_images)
     }
 
+    /// Largest useful scroll offset: the rows above the visible window.
+    ///
+    /// `scroll` counts from the bottom, so this is the offset that shows the
+    /// oldest lines. Computed from the live terminal size and the transcript
+    /// contents so Home lands exactly at the top.
+    fn max_scroll(&self) -> usize {
+        let Ok(size) = self.terminal.size() else {
+            return 0;
+        };
+        let entries = self
+            .feed
+            .lock()
+            .map(|feed| feed.entries().to_vec())
+            .unwrap_or_default();
+        let lines = transcript_lines(&entries);
+        // The transcript pane sits between a 5-row header, a 3-row prompt box
+        // and a 1-row footer, and loses two columns/rows to its border.
+        let width = size.width.saturating_sub(2) as usize;
+        let visible = size
+            .height
+            .saturating_sub(HEADER_HEIGHT + INPUT_HEIGHT + FOOTER_HEIGHT + 2)
+            as usize;
+        wrapped_height(&lines, width).saturating_sub(visible)
+    }
+
     /// Up: recall the previous prompt while composing, otherwise scroll.
     fn recall_previous(&mut self) {
         if up_recalls_history(&self.input, self.history.browsing()) {
@@ -360,7 +402,7 @@ impl Tui {
                 self.dirty = true;
             }
         } else {
-            self.scroll = self.scroll.saturating_add(1);
+            self.scroll = self.scroll.saturating_add(1).min(self.max_scroll());
             self.dirty = true;
         }
     }
@@ -474,10 +516,10 @@ fn render(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(HEADER_HEIGHT),
             Constraint::Min(3),
             Constraint::Length(input_height),
-            Constraint::Length(1),
+            Constraint::Length(FOOTER_HEIGHT),
         ])
         .split(area);
 
@@ -886,6 +928,29 @@ mod tests {
     }
 
     /// Render a frame into an offscreen buffer and return it as text rows.
+    fn render_to_rows_scrolled(
+        feed: &Arc<Mutex<UiFeed>>,
+        input: &str,
+        cursor: usize,
+        scroll: usize,
+    ) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, feed, input, cursor, scroll, 0, 0))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     fn render_to_rows(feed: &Arc<Mutex<UiFeed>>, input: &str, cursor: usize) -> Vec<String> {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1133,6 +1198,38 @@ mod tests {
         // last row must still be on screen.
         assert!(screen.contains("row 39"), "newest row missing:\n{screen}");
         assert!(!screen.contains("row 0\n"), "oldest row should be scrolled off:\n{screen}");
+    }
+
+    #[test]
+    fn scrolling_to_the_top_reveals_the_oldest_row() {
+        let feed = Arc::new(Mutex::new(UiFeed::default()));
+        {
+            let mut feed = feed.lock().unwrap();
+            for index in 0..40 {
+                feed.push(FeedEntry::Notice {
+                    level: NoticeLevel::Hint,
+                    text: format!("row {index}"),
+                });
+            }
+        }
+        // 24 rows tall: header 5 + prompt 3 + footer 1 leaves 15 for the pane,
+        // minus its two border rows = 13 visible transcript rows.
+        let visible = 24 - HEADER_HEIGHT - INPUT_HEIGHT - FOOTER_HEIGHT - 2;
+        let max_scroll = 40usize.saturating_sub(visible as usize);
+        assert!(max_scroll > 0, "fixture must overflow the pane");
+
+        let top = render_to_rows_scrolled(&feed, "", 0, max_scroll).join("\n");
+        assert!(top.contains("row 0"), "oldest row missing at top:\n{top}");
+        assert!(
+            !top.contains("row 39"),
+            "newest row should be off screen:\n{top}"
+        );
+
+        let bottom = render_to_rows_scrolled(&feed, "", 0, 0).join("\n");
+        assert!(
+            bottom.contains("row 39"),
+            "newest row missing at bottom:\n{bottom}"
+        );
     }
 
     #[test]
