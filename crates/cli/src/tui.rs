@@ -818,16 +818,18 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_is_hidden_until_enabled() {
+    fn reasoning_is_on_by_default_and_toggleable() {
         let feed = Arc::new(Mutex::new(UiFeed::default()));
         let output = crate::ui::Output::tui(feed.clone());
-        output.reasoning("secret thoughts");
-        assert!(feed.lock().unwrap().entries().is_empty());
+        assert!(output.show_reasoning());
 
-        assert!(output.set_show_reasoning(true));
         output.reasoning("secret thoughts");
         let entries = feed.lock().unwrap().entries().to_vec();
         assert!(matches!(entries.as_slice(), [FeedEntry::Reasoning(_)]));
+
+        assert!(!output.set_show_reasoning(false));
+        output.reasoning("more thoughts");
+        assert_eq!(feed.lock().unwrap().entries().len(), 1);
     }
 
     #[test]

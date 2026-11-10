@@ -218,8 +218,8 @@ pub struct Output {
     at_line_start: AtomicBool,
     /// When set, output is collected for a TUI instead of printed.
     feed: Option<Arc<Mutex<UiFeed>>>,
-    /// Render model reasoning ("thinking") in the transcript. Shared across
-    /// clones so `/thinking` toggles every surface at once.
+    /// Render model reasoning ("thinking") in the transcript. On by default;
+    /// shared across clones so `/thinking` toggles every surface at once.
     show_reasoning: Arc<AtomicBool>,
 }
 
@@ -249,7 +249,7 @@ impl Output {
             interactive: false,
             at_line_start: AtomicBool::new(true),
             feed: None,
-            show_reasoning: Arc::new(AtomicBool::new(false)),
+            show_reasoning: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -263,7 +263,7 @@ impl Output {
             interactive: color,
             at_line_start: AtomicBool::new(true),
             feed: None,
-            show_reasoning: Arc::new(AtomicBool::new(false)),
+            show_reasoning: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -276,7 +276,7 @@ impl Output {
             interactive: false,
             at_line_start: AtomicBool::new(true),
             feed: Some(feed),
-            show_reasoning: Arc::new(AtomicBool::new(false)),
+            show_reasoning: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -289,7 +289,7 @@ impl Output {
             interactive: false,
             at_line_start: AtomicBool::new(true),
             feed: None,
-            show_reasoning: Arc::new(AtomicBool::new(false)),
+            show_reasoning: Arc::new(AtomicBool::new(true)),
         }
     }
 

@@ -80,7 +80,7 @@ Slash commands:
 /stats         lifetime token usage for this project
 /new           start a fresh session
 /mode [build|plan]  show or switch agent mode
-/thinking [on|off]  show or toggle model reasoning output
+/thinking [on|off]  toggle model reasoning output (on by default)
 /paste         attach the clipboard image to the next prompt
 /image <path>  attach an image file to the next prompt
 /images        list pending attachments
